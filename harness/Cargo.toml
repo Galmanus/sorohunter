@@ -1,0 +1,15 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+soroban-sdk = { version = "25.0.1", features = ["testutils"] }
+
+[profile.release]
+opt-level = 2
