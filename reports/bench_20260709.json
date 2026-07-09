@@ -1,0 +1,89 @@
+{
+  "evaluation": {
+    "tp": 1,
+    "fp": 0,
+    "fn": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "per_contract": [
+      {
+        "contract": "vuln_vault",
+        "flagged": [
+          "withdraw"
+        ],
+        "expected": [
+          "withdraw"
+        ],
+        "tp": [
+          "withdraw"
+        ],
+        "fp": [],
+        "fn": []
+      },
+      {
+        "contract": "safe_vault",
+        "flagged": [],
+        "expected": [],
+        "tp": [],
+        "fp": [],
+        "fn": []
+      }
+    ]
+  },
+  "results": [
+    {
+      "contract": "vuln_vault",
+      "wasm": "/home/galmanus/sorohunter/bench/target/wasm32v1-none/release/vuln_vault.wasm",
+      "verdicts": [
+        {
+          "fn": "balance",
+          "arg_types": "address",
+          "verdict": "view",
+          "events_delta": 0,
+          "detail": "succeeded, no event \u2014 read-only"
+        },
+        {
+          "fn": "deposit",
+          "arg_types": "address,i128",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        },
+        {
+          "fn": "withdraw",
+          "arg_types": "address,i128",
+          "verdict": "breach",
+          "events_delta": 1,
+          "detail": "succeeded and emitted an event under empty auth \u2014 state change without a signature"
+        }
+      ]
+    },
+    {
+      "contract": "safe_vault",
+      "wasm": "/home/galmanus/sorohunter/bench/target/wasm32v1-none/release/safe_vault.wasm",
+      "verdicts": [
+        {
+          "fn": "balance",
+          "arg_types": "address",
+          "verdict": "view",
+          "events_delta": 0,
+          "detail": "succeeded, no event \u2014 read-only"
+        },
+        {
+          "fn": "deposit",
+          "arg_types": "address,i128",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        },
+        {
+          "fn": "withdraw",
+          "arg_types": "address,i128",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        }
+      ]
+    }
+  ]
+}

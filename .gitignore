@@ -4,3 +4,4 @@ target/
 *.pem
 verdicts*.json
 .pytest_cache/
+reports/_*
