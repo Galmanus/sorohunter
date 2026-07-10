@@ -33,7 +33,7 @@ pub struct Verdict {
 }
 
 /// Verdicts that count as a real finding (mirrors report.FINDING_VERDICTS).
-pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed", "redirect", "replay", "oracle"];
+pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed", "redirect", "replay", "oracle", "counterfeit"];
 
 /// The protocol version this SDK's host runs at — stamp a state-fork snapshot
 /// with it so the host accepts it (mainnet's live protocol may be newer).
@@ -956,6 +956,164 @@ pub fn probe_oracle_lie(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract
         }
     }
     out
+}
+
+/// One counterfeit-token run: place `token_addr` at `token_idx`, the attacker at
+/// every other address slot, authorize the attacker, invoke, and return the
+/// attacker's max gain in any REAL reserve token (never the counterfeit).
+fn token_lie_gain(env: &Env, contract: &str, real_tokens: &[String], p: &FnPlan, token_idx: usize, token_addr: &Address) -> Option<i128> {
+    let attacker = Address::generate(env);
+    let attacker_str = addr_to_str(&attacker)?;
+    let args = synth_oracle_args(env, &p.inputs, token_idx, token_addr, &attacker, ORACLE_LIE_AMOUNT)?;
+    let before: Vec<Option<i128>> = real_tokens.iter().map(|t| token_balance(env, t, &attacker_str)).collect();
+    let caddr = Address::from_string(&SString::from_str(env, contract));
+    env.mock_all_auths();
+    let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &p.name), args);
+    let mut gain = 0i128;
+    for (i, t) in real_tokens.iter().enumerate() {
+        if let (Some(b), Some(a)) = (before[i], token_balance(env, t, &attacker_str)) {
+            gain = gain.max(a - b);
+        }
+    }
+    Some(gain)
+}
+
+/// Token-balance-lie detector — the token-axis sibling of oracle-lie. A contract
+/// that accepts a CALLER-SUPPLIED token without allowlisting it can be handed a
+/// counterfeit whose `transfer` moves nothing and whose `balance` lies. Differential
+/// probe per address slot: run with the planted counterfeit token vs a plain
+/// (non-contract) address at that slot. If the attacker extracts strictly more REAL
+/// reserve with the counterfeit — because a plain address is not a callable token
+/// and reverts — the contract paid real value for a fake deposit / lied balance.
+pub fn probe_token_lie(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &str, real_tokens: &[String], plan: &[FnPlan], token_wasm: &[u8]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    for p in plan.iter().filter(|p| p.synthesizable && p.name != "__constructor" && p.inputs.iter().any(|t| t == "address")) {
+        let addr_idxs: Vec<usize> = p.inputs.iter().enumerate().filter(|(_, t)| *t == "address").map(|(i, _)| i).collect();
+        for &ti in &addr_idxs {
+            let env_f = forked_env(source.clone(), li);
+            let fake = env_f.register(token_wasm, ());
+            let gf = token_lie_gain(&env_f, contract, real_tokens, p, ti, &fake);
+            let env_p = forked_env(source.clone(), li);
+            let plain = Address::generate(&env_p);
+            let gp = token_lie_gain(&env_p, contract, real_tokens, p, ti, &plain);
+            if let (Some(gf), Some(gp)) = (gf, gp) {
+                if gf > gp {
+                    out.push(Verdict {
+                        fn_name: p.name.clone(),
+                        arg_types: p.inputs.join(","),
+                        verdict: "counterfeit".into(),
+                        events_delta: 0,
+                        detail: format!(
+                            "OBJ-COUNTERFEIT: {}() paid the attacker {} of a real reserve token in exchange for a caller-supplied token at arg #{} that is a planted counterfeit (its transfer moves nothing, its balance lies) — the contract accepts an unvalidated token as real value (fake-deposit / balance-inflation, no allowlist). CONFIRMED against forked state",
+                            p.name, gf - gp, ti
+                        ),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod token_lie_tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+
+    const TOKEN_WASM: &[u8] = include_bytes!("../assets/liar_token.wasm");
+
+    #[contracttype]
+    enum TKey {
+        Reserve,
+        Allowed,
+    }
+
+    // VULN: `deposit` "receives" a caller-supplied token and pays the user the same
+    // amount from its REAL reserve — with no check that the token is genuine.
+    #[contract]
+    struct FakeDepositVault;
+    #[contractimpl]
+    impl FakeDepositVault {
+        pub fn __constructor(e: Env, reserve: Address) {
+            e.storage().instance().set(&TKey::Reserve, &reserve);
+        }
+        pub fn deposit(e: Env, user: Address, dep_token: Address, amount: i128) {
+            user.require_auth();
+            token::Client::new(&e, &dep_token).transfer(&user, &e.current_contract_address(), &amount);
+            let reserve: Address = e.storage().instance().get(&TKey::Reserve).unwrap();
+            token::Client::new(&e, &reserve).transfer(&e.current_contract_address(), &user, &amount);
+        }
+    }
+
+    // CORRECT: only the allowlisted token is accepted; a counterfeit is rejected.
+    #[contract]
+    struct AllowlistTokenVault;
+    #[contractimpl]
+    impl AllowlistTokenVault {
+        pub fn __constructor(e: Env, reserve: Address, allowed: Address) {
+            e.storage().instance().set(&TKey::Reserve, &reserve);
+            e.storage().instance().set(&TKey::Allowed, &allowed);
+        }
+        pub fn deposit(e: Env, user: Address, dep_token: Address, amount: i128) {
+            user.require_auth();
+            let allowed: Address = e.storage().instance().get(&TKey::Allowed).unwrap();
+            if dep_token != allowed {
+                panic!("token not allowed");
+            }
+            token::Client::new(&e, &dep_token).transfer(&user, &e.current_contract_address(), &amount);
+            let reserve: Address = e.storage().instance().get(&TKey::Reserve).unwrap();
+            token::Client::new(&e, &reserve).transfer(&e.current_contract_address(), &user, &amount);
+        }
+    }
+
+    fn make_token(env: &Env) -> Address {
+        env.register_stellar_asset_contract_v2(Address::generate(env)).address()
+    }
+    fn mint(env: &Env, t: &Address, to: &Address, amount: i128) {
+        token::StellarAssetClient::new(env, t).mint(to, &amount);
+    }
+    fn plan() -> FnPlan {
+        FnPlan { name: "deposit".into(), inputs: std::vec!["address".into(), "address".into(), "i128".into()], synthesizable: true, skip_reason: None }
+    }
+
+    #[test]
+    fn token_lie_flags_counterfeit_deposit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let reserve = make_token(&env);
+        let vault = env.register(FakeDepositVault, (reserve.clone(),));
+        mint(&env, &reserve, &vault, 10_000_000);
+        let real = std::vec![addr_to_str(&reserve).unwrap()];
+        let contract = addr_to_str(&vault).unwrap();
+        // counterfeit token at slot 1 vs a plain address at slot 1
+        let fake = env.register(TOKEN_WASM, ());
+        let gf = token_lie_gain(&env, &contract, &real, &plan(), 1, &fake).unwrap();
+        let env2 = Env::default();
+        env2.mock_all_auths();
+        let reserve2 = make_token(&env2);
+        let vault2 = env2.register(FakeDepositVault, (reserve2.clone(),));
+        mint(&env2, &reserve2, &vault2, 10_000_000);
+        let real2 = std::vec![addr_to_str(&reserve2).unwrap()];
+        let plain = Address::generate(&env2);
+        let gp = token_lie_gain(&env2, &addr_to_str(&vault2).unwrap(), &real2, &plan(), 1, &plain).unwrap();
+        assert!(gf > gp, "counterfeit token must extract more real reserve than a plain address (gf={} gp={})", gf, gp);
+    }
+
+    #[test]
+    fn token_lie_silent_on_allowlisted_token() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let reserve = make_token(&env);
+        let allowed = make_token(&env);
+        let vault = env.register(AllowlistTokenVault, (reserve.clone(), allowed));
+        mint(&env, &reserve, &vault, 10_000_000);
+        let real = std::vec![addr_to_str(&reserve).unwrap()];
+        let contract = addr_to_str(&vault).unwrap();
+        let fake = env.register(TOKEN_WASM, ());
+        let gf = token_lie_gain(&env, &contract, &real, &plan(), 1, &fake).unwrap();
+        assert_eq!(gf, 0, "an allowlisted-token check must reject the counterfeit (no real reserve leaves)");
+    }
 }
 
 #[cfg(test)]
