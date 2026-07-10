@@ -247,6 +247,20 @@ fn cmd_econ(id: &str, network: &str) -> i32 {
             println!("  [DRAIN]  {}({})  {}", d.fn_name, d.arg_types, d.detail);
         }
     }
+
+    // The authorized counterpart: the attacker signs, and we flag any fn that
+    // pays the attacker unearned value (broken accounting / unchecked payout) —
+    // the class the empty-auth drain probe reverts on and misses.
+    let source3 = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+    let greed = engine::probe_greed(source3, &li, id, &tokens, &plan);
+    println!("\n=== economic greed probe ({} mutating fns, attacker auth, real reserves) ===", n_mut);
+    if greed.is_empty() {
+        println!("  no greed — no mutating fn paid an authorizing attacker unearned value from a zero position.");
+    } else {
+        for g in &greed {
+            println!("  [GREED]  {}({})  {}", g.fn_name, g.arg_types, g.detail);
+        }
+    }
     0
 }
 

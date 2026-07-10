@@ -21,6 +21,7 @@ pub fn mark(verdict: &str) -> &'static str {
         "hijack" => "HIJACK",
         "reinit" => "REINIT",
         "drain" => "DRAIN",
+        "greed" => "GREED",
         "init-guarded" => "init-guarded",
         "held" => "held",
         "view" => "view",
