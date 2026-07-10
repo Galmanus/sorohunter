@@ -1526,6 +1526,7 @@ name = "soro"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "soroban-ledger-snapshot",
  "soroban-sdk",
  "soroban-spec",
  "stellar-strkey 0.0.13",
