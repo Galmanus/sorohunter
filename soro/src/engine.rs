@@ -33,7 +33,7 @@ pub struct Verdict {
 }
 
 /// Verdicts that count as a real finding (mirrors report.FINDING_VERDICTS).
-pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed"];
+pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed", "redirect"];
 
 /// The protocol version this SDK's host runs at — stamp a state-fork snapshot
 /// with it so the host accepts it (mainnet's live protocol may be newer).
@@ -546,6 +546,232 @@ pub fn probe_hijack(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &s
         }
     }
     out
+}
+
+/// Build args placing a distinct authorizer at `auth_idx` and the attacker
+/// `recipient` at every other address slot; non-address args get their default
+/// synth. This is what decouples the *authorizer* from the *beneficiary* — the
+/// property `greed` (which injects one attacker into every slot) cannot express.
+fn synth_decoupled(
+    env: &Env,
+    types: &[String],
+    auth_idx: usize,
+    authorizer: &Address,
+    recipient: &Address,
+) -> Option<SVec<Val>> {
+    let mut args = SVec::new(env);
+    for (i, t) in types.iter().enumerate() {
+        let v = if t == "address" {
+            if i == auth_idx {
+                authorizer.clone().into_val(env)
+            } else {
+                recipient.clone().into_val(env)
+            }
+        } else {
+            synth(env, t, None)?
+        };
+        args.push_back(v);
+    }
+    Some(args)
+}
+
+/// Injected-recipient / caller-supplied-address-trust check (TA-05) for one fn,
+/// in an already-forked `env`. The agent-payment class: a legitimately authorized
+/// caller can redirect the contract's value to an attacker-supplied address the
+/// contract never bound auth to (Bankr/Grok ~$150-180K, MCP router drain $500K —
+/// the agent *was* authorized; the recipient was injected).
+///
+/// For each address arg tried as the sole authorizer (auth forged scoped to that
+/// address only — never the recipient), the attacker takes every other address
+/// slot as beneficiary. If a reserve token leaves the contract and lands on the
+/// non-authorizing attacker, the recipient was unbound. This is decoupled from
+/// `greed`: a contract that forbids self-pay (`recipient != caller`) silences
+/// greed's single-attacker injection but is fully exposed here.
+fn redirect_check_in_env(env: &Env, contract: &str, tokens: &[String], p: &FnPlan) -> Option<Verdict> {
+    let addr_idxs: Vec<usize> = p
+        .inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| *t == "address")
+        .map(|(i, _)| i)
+        .collect();
+    if addr_idxs.len() < 2 {
+        return None;
+    }
+    let caddr = Address::from_string(&SString::from_str(env, contract));
+    for &auth_idx in &addr_idxs {
+        let authorizer = Address::generate(env);
+        let recipient = Address::generate(env);
+        let recipient_str = match addr_to_str(&recipient) {
+            Some(s) => s,
+            None => continue,
+        };
+        let args = match synth_decoupled(env, &p.inputs, auth_idx, &authorizer, &recipient) {
+            Some(a) => a,
+            None => continue,
+        };
+        let before_c: Vec<Option<i128>> = tokens.iter().map(|t| token_balance(env, t, contract)).collect();
+        let before_r: Vec<Option<i128>> = tokens.iter().map(|t| token_balance(env, t, &recipient_str)).collect();
+        env.set_auths(&[]);
+        env.mock_auths(&[MockAuth {
+            address: &authorizer,
+            invoke: &MockAuthInvoke {
+                contract: &caddr,
+                fn_name: &p.name,
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }]);
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &p.name), args);
+        for (i, t) in tokens.iter().enumerate() {
+            let after_c = token_balance(env, t, contract);
+            let after_r = token_balance(env, t, &recipient_str);
+            if let (Some(bc), Some(ac), Some(br), Some(ar)) = (before_c[i], after_c, before_r[i], after_r) {
+                if ac < bc && ar > br {
+                    return Some(Verdict {
+                        fn_name: p.name.clone(),
+                        arg_types: p.inputs.join(","),
+                        verdict: "redirect".into(),
+                        events_delta: 0,
+                        detail: format!(
+                            "OBJ-REDIRECT: {}() let an authorized caller send {} of {} to an attacker-supplied recipient that never signed — caller-supplied-address trust (injected-recipient / agent-payment class, TA-05), CONFIRMED against forked state",
+                            p.name, ar - br, t
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Injected-recipient detector (TA-05): the auth-scoping sibling of the economic
+/// probes. For each mutating fn with two or more address args, in a fresh forked
+/// env, flag any fn that pays the contract's reserves to an attacker-supplied
+/// address that never authorized (see `redirect_check_in_env`).
+pub fn probe_redirect(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &str, tokens: &[String], plan: &[FnPlan]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    for p in plan.iter().filter(|p| {
+        p.synthesizable
+            && p.name != "__constructor"
+            && p.inputs.iter().filter(|t| *t == "address").count() >= 2
+    }) {
+        let env = forked_env(source.clone(), li);
+        if let Some(v) = redirect_check_in_env(&env, contract, tokens, p) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+
+    #[contracttype]
+    enum RKey {
+        Token,
+    }
+
+    // VULN: `pay` authorizes the operator and forbids self-pay, then sends reserves
+    // to an arbitrary `recipient` it never binds auth to. The self-pay guard is
+    // exactly what makes greed's single-attacker injection revert (silent) while the
+    // decoupled authorizer/recipient injection here drains it — TA-05, not greed.
+    #[contract]
+    struct RedirectVault;
+    #[contractimpl]
+    impl RedirectVault {
+        pub fn __constructor(e: Env, token: Address) {
+            e.storage().instance().set(&RKey::Token, &token);
+        }
+        pub fn pay(e: Env, operator: Address, recipient: Address, amount: i128) {
+            operator.require_auth();
+            if operator == recipient {
+                panic!("no self-pay");
+            }
+            let t: Address = e.storage().instance().get(&RKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &recipient, &amount);
+        }
+    }
+
+    // CORRECT: `pay` binds the recipient too — it must consent. An attacker
+    // recipient that never signs makes require_auth revert, so nothing moves.
+    #[contract]
+    struct BoundRouter;
+    #[contractimpl]
+    impl BoundRouter {
+        pub fn __constructor(e: Env, token: Address) {
+            e.storage().instance().set(&RKey::Token, &token);
+        }
+        pub fn pay(e: Env, operator: Address, recipient: Address, amount: i128) {
+            operator.require_auth();
+            recipient.require_auth();
+            let t: Address = e.storage().instance().get(&RKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &recipient, &amount);
+        }
+    }
+
+    fn make_token(env: &Env) -> Address {
+        let issuer = Address::generate(env);
+        env.register_stellar_asset_contract_v2(issuer).address()
+    }
+
+    fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
+        token::StellarAssetClient::new(env, token).mint(to, &amount);
+    }
+
+    fn plan(name: &str) -> FnPlan {
+        FnPlan {
+            name: name.into(),
+            inputs: std::vec!["address".into(), "address".into(), "i128".into()],
+            synthesizable: true,
+            skip_reason: None,
+        }
+    }
+
+    #[test]
+    fn redirect_flags_unbound_recipient() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token_addr = make_token(&env);
+        let vault = env.register(RedirectVault, (token_addr.clone(),));
+        mint(&env, &token_addr, &vault, 1_000);
+        let contract = addr_to_str(&vault).unwrap();
+        let tokens = std::vec![addr_to_str(&token_addr).unwrap()];
+        let v = redirect_check_in_env(&env, &contract, &tokens, &plan("pay"));
+        assert!(v.is_some(), "redirect detector must flag an unbound-recipient payout");
+        assert_eq!(v.unwrap().verdict, "redirect");
+    }
+
+    #[test]
+    fn redirect_silent_on_bound_recipient() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token_addr = make_token(&env);
+        let vault = env.register(BoundRouter, (token_addr.clone(),));
+        mint(&env, &token_addr, &vault, 1_000);
+        let contract = addr_to_str(&vault).unwrap();
+        let tokens = std::vec![addr_to_str(&token_addr).unwrap()];
+        let v = redirect_check_in_env(&env, &contract, &tokens, &plan("pay"));
+        assert!(v.is_none(), "redirect detector must NOT flag a recipient-bound router");
+    }
+
+    // Guard the greed/redirect boundary: the same self-pay-guarded vault that
+    // redirect flags must leave greed SILENT (its single-attacker injection hits
+    // the `operator == recipient` panic), proving the two detectors are orthogonal.
+    #[test]
+    fn greed_silent_where_redirect_fires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token_addr = make_token(&env);
+        let vault = env.register(RedirectVault, (token_addr.clone(),));
+        mint(&env, &token_addr, &vault, 1_000);
+        let contract = addr_to_str(&vault).unwrap();
+        let tokens = std::vec![addr_to_str(&token_addr).unwrap()];
+        let g = greed_check_in_env(&env, &contract, &tokens, &plan("pay"));
+        assert!(g.is_none(), "greed must be silent on the self-pay-guarded vault (redirect's domain)");
+    }
 }
 
 #[cfg(test)]

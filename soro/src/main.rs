@@ -268,6 +268,24 @@ fn cmd_econ(id: &str, network: &str) -> i32 {
             println!("  [GREED]  {}({})  {}", g.fn_name, g.arg_types, g.detail);
         }
     }
+
+    // Caller-supplied-address trust: an authorized caller redirects reserves to an
+    // attacker-supplied recipient that never signed — the agent-payment injected-
+    // recipient class greed misses when the contract forbids self-pay.
+    let n_multi = plan
+        .iter()
+        .filter(|p| p.synthesizable && p.inputs.iter().filter(|t| *t == "address").count() >= 2)
+        .count();
+    let source4 = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+    let redirect = engine::probe_redirect(source4, &li, id, &tokens, &plan);
+    println!("\n=== injected-recipient probe ({} multi-address fns, authorizer != recipient, real reserves) ===", n_multi);
+    if redirect.is_empty() {
+        println!("  no redirect — no fn paid the contract's reserves to an unbound attacker-supplied recipient.");
+    } else {
+        for r in &redirect {
+            println!("  [REDIRECT]  {}({})  {}", r.fn_name, r.arg_types, r.detail);
+        }
+    }
     0
 }
 
