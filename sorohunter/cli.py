@@ -23,6 +23,7 @@ from sorohunter.abi import parse_spec  # noqa: E402
 from sorohunter import report as rep  # noqa: E402
 
 BENCH_WASM = os.path.join(ROOT, "bench", "target", "wasm32v1-none", "release")
+ATTACKER_WASM = os.path.join(BENCH_WASM, "attacker_pwn.wasm")
 REPORTS = os.path.join(ROOT, "reports")
 
 
@@ -60,7 +61,36 @@ def probe_wasm(wasm_path: str, entries: list[dict], out_json: str) -> list[dict]
             verdicts.append({"fn": p["name"], "arg_types": ",".join(p["inputs"]),
                              "verdict": "skipped", "events_delta": 0, "detail": p["skip_reason"]})
     verdicts += probe_chains(wasm_path, plan, verdicts, out_json)
+    verdicts += probe_upgrades(wasm_path, plan, out_json)
     return verdicts
+
+
+def probe_upgrades(wasm_path: str, plan: list[dict], out_json: str) -> list[dict]:
+    """Fork-validate unprotected-upgrade hijacks (TP-01).
+
+    Candidate upgrade entry points are functions taking a 32-byte hash
+    (`bytes_n:32` — a wasm hash). The harness uploads an attacker payload, calls
+    the candidate under empty auth with the payload's hash, and confirms the
+    hijack only if the code actually swapped (the payload's marker executes). A
+    non-upgrade function that merely takes a hash swaps nothing and is not
+    flagged, so the heuristic cannot raise a false positive.
+    """
+    if not os.path.exists(ATTACKER_WASM):
+        return []  # no payload to swap in (bench not built)
+    up_out = out_json + ".upgrade"
+    found: list[dict] = []
+    for p in plan:
+        if not p["synthesizable"] or "bytes_n:32" not in p["inputs"]:
+            continue
+        spec = f"{p['name']}:{','.join(p['inputs'])}"
+        subprocess.run([harness_bin(), "--upgrade", wasm_path, ATTACKER_WASM, up_out, spec],
+                       check=True, capture_output=True, text=True)
+        res = json.load(open(up_out))
+        if res.get("verdict") == "hijack":
+            found.append({"fn": p["name"], "arg_types": ",".join(p["inputs"]),
+                          "verdict": "hijack", "events_delta": 0,
+                          "detail": res.get("detail", "")})
+    return found
 
 
 def probe_chains(wasm_path: str, plan: list[dict], verdicts: list[dict],
@@ -137,7 +167,7 @@ def cmd_scan(args) -> int:
     verdicts = probe_wasm(wasm, entries, os.path.join(scratch, "verdicts.json"))
     print(f"\n{args.contract_id}: {len(verdicts)} probes")
     for v in verdicts:
-        mark = {"breach": "BREACH", "chain": "CHAIN"}.get(v["verdict"], v["verdict"])
+        mark = {"breach": "BREACH", "chain": "CHAIN", "hijack": "HIJACK"}.get(v["verdict"], v["verdict"])
         print(f"  [{mark:<7}] {v['fn']}({v['arg_types']})  {v['detail']}")
     findings = [v for v in verdicts if v["verdict"] in ("breach", "chain")]
     if findings:

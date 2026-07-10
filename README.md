@@ -21,12 +21,13 @@ read-only acquisition; **no transaction is ever signed or sent to a live
 network.** That is the line between a tool and a crime, and it is a code
 invariant in the harness.
 
-## Shipped techniques (2 of the matrix)
+## Shipped techniques (3 of the matrix)
 
 - **TA-01 — missing `require_auth`.** A state mutation succeeds under empty auth. The invocation is the PoC. *(EVM analog: SWC-105 / OWASP-SC access control — the #1 Soroban footgun.)*
 - **TE-01 — composition chain (admin capture → drain).** The differentiator: some vaults are **clean to any single-function probe** yet fall to a two-step chain. sorohunter proposes candidate chains (address-setter × gated action) and confirms each **by executing it in one fork** — foothold under empty auth, then the gated action as the seized principal.
+- **TP-01 — unprotected upgrade (code hijack).** A reachable `update_current_contract_wasm` under empty auth. sorohunter uploads an attacker payload, swaps the target's code with it under empty auth, and **confirms control by calling the payload's marker** — a fresh-deploy single-fn probe misses it (a zero-hash swap just errors), the technique detector proves it.
 
-The rest of the [matrix](SOROBAN_ATTACK.md) (TA-02..05, TP, TD, TS, and the
+The rest of the [matrix](SOROBAN_ATTACK.md) (TA-02..05, TP-02, TD, TS, and the
 cryptographic/ZK tactic) is roadmap or manual, marked honestly there.
 
 ## What the benchmark measures — and what it does not
@@ -34,19 +35,22 @@ cryptographic/ZK tactic) is roadmap or manual, marked honestly there.
 ```bash
 cd bench && stellar contract build && cd ..   # build the corpus (once)
 python3 sorohunter/cli.py bench
-#   precision 100% · recall 100% (tp 2, fp 0, fn 0)
-#     vuln_vault        withdraw             (TA-01)
-#     safe_vault        clean
-#     chain_vault       set_admin->withdraw  (TE-01 composition)
-#     safe_chain_vault  clean                (foothold gated — the FP control held)
+#   precision 100% · recall 100% (tp 3, fp 0, fn 0)
+#     vuln_vault          withdraw             (TA-01 missing-auth)
+#     safe_vault          clean
+#     chain_vault         set_admin->withdraw  (TE-01 composition)
+#     safe_chain_vault    clean                (foothold gated — FP control held)
+#     upgrade_vault       upgrade              (TP-01 code hijack)
+#     safe_upgrade_vault  clean                (upgrade gated — FP control held)
 ```
 
 **Read this honestly.** These figures are **precision-first, measured against a
-controlled ground-truth corpus** of 4 contracts: two planted vulns (a missing-
-auth drain, a composition chain) and two clean decoys (one of which is a
-composition false-positive control). They say: *the two shipped detectors catch
-their planted bugs and raise zero false alarms on the decoys, including on a
-contract that looks vulnerable but is not.* They are **not** a general-auditor
+controlled ground-truth corpus** of 6 contracts: three planted vulns (a missing-
+auth drain, a composition chain, an upgrade hijack) and three clean decoys (two
+of which are false-positive controls for the composition and upgrade detectors).
+They say: *the three shipped detectors catch their planted bugs and raise zero
+false alarms on the decoys, including on contracts that look vulnerable but are
+not.* They are **not** a general-auditor
 detection rate, and are not comparable to broad benchmarks (e.g. EVMBench's
 ~47% autonomous ceiling): this measures two specific, scoped techniques against
 ground truth we control. Precision on the decoys is the load-bearing property —
@@ -67,7 +71,7 @@ python3 sorohunter/cli.py scan <CONTRACT_ID> --network testnet   # read-only acq
 
 ## Honest limits
 
-- **2 techniques shipped** (TA-01, TE-01). The rest of the Soroban ATT&CK is roadmap (mechanical) or manual (the cryptographic/ZK tactic — that is verifier/circuit review, not fork-sim). Status is marked per cell in [`SOROBAN_ATTACK.md`](SOROBAN_ATTACK.md).
+- **3 techniques shipped** (TA-01, TE-01, TP-01). The rest of the Soroban ATT&CK is roadmap (mechanical) or manual (the cryptographic/ZK tactic — that is verifier/circuit review, not fork-sim). Status is marked per cell in [`SOROBAN_ATTACK.md`](SOROBAN_ATTACK.md).
 - `scan` fresh-deploys the fetched WASM, so a finding on a real contract is a **candidate** — confirm against a state-fork (`stellar snapshot`) before any disclosure. Never touch the live contract.
 - The event-diff misses a mutation that emits no event (this is *why* the composition detector checks the downstream gated action, not just events); an erroring view is classed `held`, not `view` (harmless — not a false positive).
 - The chain proposer is heuristic in *what it tries*; it is exact in *what it confirms* (execution). Coverage of chains it does not propose is a roadmap item.

@@ -190,8 +190,74 @@ fn probe_chain(
     }
 }
 
+/// Execute an unprotected-upgrade hijack (TP-01) in one fork: swap the target's
+/// code for the attacker payload under empty auth, then confirm control by
+/// calling the payload's marker `pwned()` and checking it returns 1337.
+fn probe_upgrade(
+    target_wasm: &[u8],
+    attacker_wasm: &[u8],
+    upgrade_fn: &str,
+    u_types: &[String],
+) -> (String, String) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let cid = env.register(target_wasm, ());
+    let attacker_hash = env.deployer().upload_contract_wasm(attacker_wasm);
+
+    let mut args = SVec::new(&env);
+    for t in u_types {
+        let v = if t == "bytes_n:32" {
+            attacker_hash.clone().into_val(&env)
+        } else {
+            match synth(&env, t, None) {
+                Some(v) => v,
+                None => return ("skipped".into(), "unsynthesizable upgrade arg".into()),
+            }
+        };
+        args.push_back(v);
+    }
+
+    env.set_auths(&[]); // the swap must land with NO signature
+    let r = env.try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, upgrade_fn), args);
+    if r.is_err() {
+        return ("held".into(), "upgrade aborts under empty auth (gated)".into());
+    }
+
+    let pwned = matches!(
+        env.try_invoke_contract::<u32, soroban_sdk::Error>(&cid, &Symbol::new(&env, "pwned"), SVec::new(&env)),
+        Ok(Ok(1337))
+    );
+    if pwned {
+        (
+            "hijack".into(),
+            format!(
+                "{}() swapped the contract code under empty auth — the attacker payload now executes (pwned=1337): OBJ-SEIZE, arbitrary control",
+                upgrade_fn
+            ),
+        )
+    } else {
+        ("held-after".into(), "upgrade ran but the code was not swapped to the attacker payload".into())
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(|s| s.as_str()) == Some("--upgrade") {
+        // --upgrade <target_wasm> <attacker_wasm> <out_json> <upgrade_fn:types>
+        let target = std::fs::read(&args[1]).expect("read target wasm");
+        let attacker = std::fs::read(&args[2]).expect("read attacker wasm");
+        let out_path = &args[3];
+        let (uname, utypes) = split_spec(&args[4]);
+        let (verdict, detail) = probe_upgrade(&target, &attacker, &uname, &utypes);
+        std::fs::write(
+            out_path,
+            format!("{{\"verdict\":\"{}\",\"detail\":\"{}\"}}", verdict, esc(&detail)),
+        )
+        .expect("write out");
+        println!("[harness --upgrade] {} : {}", args[4], verdict);
+        return;
+    }
 
     if args.first().map(|s| s.as_str()) == Some("--chain") {
         let wasm_path = &args[1];

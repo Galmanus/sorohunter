@@ -31,7 +31,7 @@ executed proof — a code invariant in the harness, not a promise.
 
 | Reconnaissance | Initial Access | Privilege Escalation | Persistence | Auth-Bypass / Evasion | Resource / Storage | Cryptographic Failure | Impact |
 |---|---|---|---|---|---|---|---|
-| TR-01 ABI/WASM acquire | **TA-01 missing `require_auth`** ✅ | **TE-01 admin capture→drain** ✅ | TP-01 unprotected upgrade | TD-01 auth-subject confusion | TS-01 TTL/archival assumption | TZ-01 underconstrained circuit | OBJ-DRAIN |
+| TR-01 ABI/WASM acquire | **TA-01 missing `require_auth`** ✅ | **TE-01 admin capture→drain** ✅ | **TP-01 unprotected upgrade** ✅ | TD-01 auth-subject confusion | TS-01 TTL/archival assumption | TZ-01 underconstrained circuit | OBJ-DRAIN |
 | TR-02 classify contract | TA-02 unprotected admin setter | TE-02 allowlist/registry poison | TP-02 admin seize+lock | TD-02 cross-contract auth propagation | TS-02 storage-exhaustion / TTL-bump grief | TZ-02 Fr modular-reduction bypass | OBJ-MINT |
 | TR-03 state/role map | TA-03 initializer re-entry | TE-03 oracle/config poison | | | TM-01 unchecked `i128` arithmetic | TZ-03 trusted-setup / VK misuse | OBJ-BRICK |
 | TR-04 dep & upgrade-hook discovery | TA-04 auth-arg scope mismatch | | | | | TZ-04 Fiat-Shamir / proof-replay | OBJ-SEIZE |
@@ -62,7 +62,7 @@ executed proof — a code invariant in the harness, not a promise.
 - **TE-03 oracle / config poisoning** — set a price/config field unauth, then trigger a legit path that pays out on the poisoned value. Roadmap.
 
 ### Persistence / Control
-- **TP-01 unprotected upgrade** — `update_current_contract_wasm` reachable under empty auth → swap logic → arbitrary. Fork-detectable (register attacker WASM in-fork). Roadmap.
+- **TP-01 unprotected upgrade** — `update_current_contract_wasm` reachable under empty auth → swap logic → arbitrary control. *Detector: the harness uploads an attacker payload, invokes the candidate upgrade fn under empty auth with the payload's hash, and confirms the hijack only if the code actually swaps (the payload's marker executes). Validated on `upgrade_vault` (hijacked) vs `safe_upgrade_vault` (gated → not flagged).* **sorohunter: SHIPPED.**
 - **TP-02 admin seize + lock** — rotate admin to attacker and remove others. Roadmap.
 
 ### Auth-Bypass / Evasion
@@ -90,8 +90,8 @@ Every confirmed chain terminates in a realized, fork-executed objective attached
 
 sorohunter is the executable substrate: for every mechanical technique it aims
 to ship a fork-validated detector so a finding is an executed transition, never
-an inferred one. Today: **2 detectors shipped — TA-01 (missing-auth) and TE-01
-(composition chain)**, ground-truth-measured; the rest are the roadmap,
+an inferred one. Today: **3 detectors shipped — TA-01 (missing-auth), TE-01
+(composition chain), TP-01 (unprotected upgrade)**, ground-truth-measured; the rest are the roadmap,
 sequenced by prevalence (Access → Composition → Persistence → Storage). The
 cryptographic tactic is deliberately marked manual —
 that is ZK-review work (Manuel's slippay-zk / verifier-audit lane), not fork-sim,
