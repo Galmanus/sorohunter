@@ -13,10 +13,14 @@ import json
 import os
 
 
+# verdicts that count as a real finding. A fresh-deploy `init-guarded` is NOT
+# one — it is a one-time initializer that is guarded on live state.
+FINDING_VERDICTS = ("breach", "chain", "hijack", "reinit")
+MARKS = {"breach": "BREACH", "chain": "CHAIN", "hijack": "HIJACK", "reinit": "REINIT"}
+
+
 def _findings(verdicts: list[dict]) -> list[str]:
-    # a finding is a single-fn missing-auth breach (TA-01), a confirmed
-    # composition chain (TE-01), or a confirmed upgrade hijack (TP-01)
-    return [v["fn"] for v in verdicts if v.get("verdict") in ("breach", "chain", "hijack")]
+    return [v["fn"] for v in verdicts if v.get("verdict") in FINDING_VERDICTS]
 
 
 def evaluate(results: list[dict], ground_truth: dict[str, list[str]]) -> dict:
@@ -76,7 +80,7 @@ def report_md(ev: dict, results: list[dict]) -> str:
             continue
         L.append(f"\n### {pc['contract']}")
         for v in r["verdicts"]:
-            mark = {"breach": "BREACH", "chain": "CHAIN", "hijack": "HIJACK"}.get(v.get("verdict"), v.get("verdict"))
+            mark = MARKS.get(v.get("verdict"), v.get("verdict"))
             L.append(f"- **[{mark}] {v['fn']}({v.get('arg_types','')})** — {v.get('detail','')}")
     L.append("")
     L.append("## Reading")

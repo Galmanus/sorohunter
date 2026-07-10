@@ -86,6 +86,14 @@ fn csv_types(csv: &str) -> Vec<String> {
     }
 }
 
+/// One-time setup functions: on a fresh-deploy fork they run once (there is no
+/// prior state), which looks like a missing-auth breach but is a fresh-deploy
+/// artifact, not a live finding. Treated specially in `probe`.
+fn is_init_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("init") || matches!(n.as_str(), "setup" | "constructor" | "__constructor" | "bootstrap" | "boot")
+}
+
 /// Probe one function in a fresh Env so probes never contaminate each other.
 fn probe(wasm: &[u8], ctor: &[String], name: &str, types: &[String]) -> (String, i64, String) {
     let env = Env::default();
@@ -108,11 +116,31 @@ fn probe(wasm: &[u8], ctor: &[String], name: &str, types: &[String]) -> (String,
 
     match res {
         Err(_) => ("held".into(), delta, "aborted under empty auth".into()),
-        Ok(_) if delta > 0 => (
-            "breach".into(),
-            delta,
-            "succeeded and emitted an event under empty auth — state change without a signature".into(),
-        ),
+        Ok(_) if delta > 0 => {
+            if is_init_name(name) {
+                // A one-time initializer runs once on a fresh deploy — a
+                // fresh-deploy artifact, not a live finding. Re-invoke under
+                // empty auth: guarded (reverts) -> suppress; runs again -> a
+                // real re-initialization bug (TA-03).
+                let repeatable = match build_args(&env, types, None) {
+                    Some(a) => env
+                        .try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, name), a)
+                        .is_ok(),
+                    None => false,
+                };
+                if repeatable {
+                    ("reinit".into(), delta, "callable more than once under empty auth — re-initialization (TA-03)".into())
+                } else {
+                    ("init-guarded".into(), delta, "one-time initializer, guarded on the second call — fresh-deploy artifact, not a live finding".into())
+                }
+            } else {
+                (
+                    "breach".into(),
+                    delta,
+                    "succeeded and emitted an event under empty auth — state change without a signature".into(),
+                )
+            }
+        }
         Ok(_) => ("view".into(), delta, "succeeded, no event — read-only".into()),
     }
 }
