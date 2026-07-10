@@ -302,6 +302,12 @@ fn probe_one_forked(snapshot: &LedgerSnapshot, contract_id: &str, name: &str, ty
 /// for economic bugs: the fork sees real liquidity. A breach here is CONFIRMED.
 pub fn probe_forked_lazy(source: Rc<RpcSnapshotSource>, ledger_info: &LedgerInfo, contract_id: &str, plan: &[FnPlan]) -> Vec<Verdict> {
     let mut out = Vec::new();
+    // Discover the contract's reserve tokens once, so a breach can be corroborated:
+    // an unauthenticated state change that neither moves reserves nor changes the
+    // admin is a permissionless-by-design maintenance call (skim/sync/status), not a
+    // CONFIRMED extraction — downgrade it rather than cry wolf.
+    let disc_env = forked_env(source.clone(), ledger_info);
+    let tokens = crate::econ::tokens_from_getters(&disc_env, contract_id, plan);
     for p in plan.iter().filter(|p| p.name != "__constructor") {
         if !p.synthesizable {
             out.push(Verdict {
@@ -313,7 +319,7 @@ pub fn probe_forked_lazy(source: Rc<RpcSnapshotSource>, ledger_info: &LedgerInfo
             });
             continue;
         }
-        let (v, d, det) = probe_one_forked_lazy(source.clone(), ledger_info, contract_id, &p.name, &p.inputs);
+        let (v, d, det) = probe_one_forked_lazy(source.clone(), ledger_info, contract_id, &p.name, &p.inputs, &tokens);
         out.push(Verdict {
             fn_name: p.name.clone(),
             arg_types: p.inputs.join(","),
@@ -325,7 +331,7 @@ pub fn probe_forked_lazy(source: Rc<RpcSnapshotSource>, ledger_info: &LedgerInfo
     out
 }
 
-fn probe_one_forked_lazy(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract_id: &str, name: &str, types: &[String]) -> (String, i64, String) {
+fn probe_one_forked_lazy(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract_id: &str, name: &str, types: &[String], tokens: &[String]) -> (String, i64, String) {
     let src: Rc<dyn SnapshotSource> = source;
     let env = Env::from_ledger_snapshot(SnapshotSourceInput {
         source: src,
@@ -339,16 +345,37 @@ fn probe_one_forked_lazy(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contrac
     };
     env.set_auths(&[]);
     let before = env.events().all().events().len() as i64;
+    let reserves_before: Vec<Option<i128>> = tokens.iter().map(|t| token_balance(&env, t, contract_id)).collect();
+    let admin_before = read_admin(&env, contract_id);
     let res = env.try_invoke_contract::<Val, soroban_sdk::Error>(&addr, &Symbol::new(&env, name), args);
     let after = env.events().all().events().len() as i64;
     let delta = after - before;
     match res {
         Err(_) => ("held".into(), delta, "aborted under empty auth (real forked state)".into()),
-        Ok(_) if delta > 0 => (
-            "breach".into(),
-            delta,
-            "CONFIRMED against real forked state: state change + event under empty auth — missing auth".into(),
-        ),
+        Ok(_) if delta > 0 => {
+            // Corroborate: did the unauthenticated call actually extract reserves or
+            // capture control? If not, it is a permissionless-by-design state change.
+            let drained = tokens.iter().enumerate().any(|(i, t)| {
+                matches!((reserves_before[i], token_balance(&env, t, contract_id)), (Some(b), Some(a)) if a < b)
+            });
+            let admin_changed = matches!(
+                (&admin_before, read_admin(&env, contract_id)),
+                (Some(b), Some(a)) if a != *b
+            );
+            if drained || admin_changed {
+                (
+                    "breach".into(),
+                    delta,
+                    "CONFIRMED against real forked state: unauthenticated call moved reserves or changed the admin — extractive/control-capturing missing auth".into(),
+                )
+            } else {
+                (
+                    "permissionless".into(),
+                    delta,
+                    "state change + event under empty auth, but NO reserve left the contract and the admin is unchanged — a permissionless-by-design maintenance call (skim/sync/status-update class) or an unauthenticated config setter; review intent, not a confirmed extraction".into(),
+                )
+            }
+        }
         Ok(_) => ("view".into(), delta, "succeeded, no event — read-only".into()),
     }
 }

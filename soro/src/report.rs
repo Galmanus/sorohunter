@@ -27,6 +27,7 @@ pub fn mark(verdict: &str) -> &'static str {
         "oracle" => "ORACLE",
         "counterfeit" => "COUNTERFEIT",
         "init-guarded" => "init-guarded",
+        "permissionless" => "permless",
         "held" => "held",
         "view" => "view",
         "skipped" => "skipped",
