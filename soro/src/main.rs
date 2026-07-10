@@ -14,37 +14,15 @@
 mod abi;
 mod engine;
 mod report;
+mod rpc;
 
 use std::collections::BTreeMap;
-use std::process::Command;
 
 use serde_json::Value;
 
 /// The attacker payload for the upgrade detector, embedded so the binary is
 /// self-contained.
 const ATTACKER: &[u8] = include_bytes!("../assets/attacker_pwn.wasm");
-
-/// Read a contract's spec via the stellar CLI (stage-1 acquisition; a native
-/// spec-from-wasm parse is the next increment).
-fn abi_entries(extra: &[&str]) -> Vec<Value> {
-    let out = Command::new("stellar")
-        .args(["contract", "info", "interface"])
-        .args(extra)
-        .args(["--output", "json"])
-        .output();
-    let stdout = match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => return Vec::new(),
-    };
-    // the CLI prints a status line before the JSON array
-    match stdout.find('[') {
-        Some(i) => serde_json::from_str::<Value>(&stdout[i..])
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default(),
-        None => Vec::new(),
-    }
-}
 
 fn probe_wasm_file(path: &str) -> Vec<engine::Verdict> {
     let wasm = std::fs::read(path).unwrap_or_default();
@@ -128,20 +106,16 @@ fn cmd_probe(wasms: &[String]) -> i32 {
 /// Acquire a public contract read-only (fetch WASM + spec via the stellar CLI)
 /// and probe a local fork. Never touches the deployed contract.
 fn cmd_scan(id: &str, network: &str) -> i32 {
-    eprintln!("acquiring {} ({}) — read-only ...", id, network);
-    let tmp = std::env::temp_dir().join(format!("soro_scan_{}.wasm", id));
-    let tmps = tmp.to_string_lossy().into_owned();
-    let fetched = Command::new("stellar")
-        .args(["contract", "fetch", "--id", id, "--network", network, "--out-file", &tmps])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !fetched {
-        eprintln!("fetch failed");
-        return 1;
-    }
-    let wasm = std::fs::read(&tmp).unwrap_or_default();
-    // native: ABI from the fetched WASM's custom section (no `info interface`).
+    eprintln!("acquiring {} ({}) — read-only via RPC ...", id, network);
+    // native: fetch the WASM over Soroban RPC (getLedgerEntries), no stellar CLI.
+    let wasm = match rpc::fetch_wasm(rpc::rpc_url(network), id) {
+        Some(w) => w,
+        None => {
+            eprintln!("could not fetch wasm via RPC (bad id, not found, or RPC error)");
+            return 1;
+        }
+    };
+    // native: ABI straight from the fetched WASM's custom section.
     let plan = abi::plan_from_wasm(&wasm);
     if plan.is_empty() {
         eprintln!("no contract spec found in fetched wasm");

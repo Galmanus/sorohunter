@@ -16,3 +16,6 @@ soroban-sdk = { version = "25", features = ["testutils"] }
 # native spec-from-wasm: read the contract ABI directly from the WASM custom
 # section, no `stellar contract info interface` shell-out.
 soroban-spec = "25"
+# native RPC fetch: getLedgerEntries over JSON-RPC, no `stellar contract fetch`.
+ureq = { version = "2", features = ["json"] }
+stellar-strkey = "0.0.13"
