@@ -33,7 +33,7 @@ pub struct Verdict {
 }
 
 /// Verdicts that count as a real finding (mirrors report.FINDING_VERDICTS).
-pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain"];
+pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed"];
 
 /// The protocol version this SDK's host runs at — stamp a state-fork snapshot
 /// with it so the host accepts it (mainnet's live protocol may be newer).
@@ -413,4 +413,162 @@ pub fn probe_drain(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &st
         }
     }
     out
+}
+
+/// The std-string (C-address) form of a soroban `Address`, for `token_balance`.
+fn addr_to_str(a: &Address) -> Option<std::string::String> {
+    let s = a.to_string();
+    let mut buf = std::vec![0u8; s.len() as usize];
+    s.copy_into_slice(&mut buf);
+    std::string::String::from_utf8(buf).ok()
+}
+
+/// Attacker-authorized net-gain check for one fn, in an already-forked `env`.
+///
+/// The empty-auth drain detector misses the *authorized* economic bug: a fn that
+/// calls `caller.require_auth()` (so it aborts under empty auth) but then pays the
+/// caller value they never earned — unchecked `claim`/`withdraw`, broken
+/// accounting, a payout that forgets to verify a deposit/position. Here the
+/// attacker authorizes everything (`mock_all_auths`); starting from a fresh zero
+/// position, if invoking the fn leaves the attacker holding MORE of any token,
+/// the contract paid unearned value to whoever signs — a confirmed economic
+/// exploit. Returns the finding or `None`.
+fn greed_check_in_env(env: &Env, contract: &str, tokens: &[String], p: &FnPlan) -> Option<Verdict> {
+    let attacker = Address::generate(env);
+    let attacker_str = addr_to_str(&attacker)?;
+    let before: Vec<Option<i128>> =
+        tokens.iter().map(|t| token_balance(env, t, &attacker_str)).collect();
+    let caddr = Address::from_string(&SString::from_str(env, contract));
+    let args = build_args(env, &p.inputs, Some(&attacker))?;
+    env.mock_all_auths();
+    let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &p.name), args);
+    for (i, t) in tokens.iter().enumerate() {
+        let after = token_balance(env, t, &attacker_str);
+        if let (Some(b), Some(a)) = (before[i], after) {
+            if a > b {
+                return Some(Verdict {
+                    fn_name: p.name.clone(),
+                    arg_types: p.inputs.join(","),
+                    verdict: "greed".into(),
+                    events_delta: 0,
+                    detail: format!(
+                        "OBJ-GREED: {}() under attacker auth paid the caller {} of {} from a zero position — authorized-but-unearned value extraction (broken accounting / unchecked payout), CONFIRMED against forked state",
+                        p.name, a - b, t
+                    ),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Economic greed detector: the attacker-authorized counterpart to `probe_drain`.
+/// For each mutating fn, in a fresh forked env, let the attacker authorize the
+/// call and flag any fn that leaves the attacker richer (see `greed_check_in_env`).
+pub fn probe_greed(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &str, tokens: &[String], plan: &[FnPlan]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    for p in plan.iter().filter(|p| p.synthesizable && !p.inputs.is_empty() && p.name != "__constructor") {
+        let env = forked_env(source.clone(), li);
+        if let Some(v) = greed_check_in_env(&env, contract, tokens, p) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod greed_tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+
+    #[contracttype]
+    enum GKey {
+        Token,
+    }
+
+    // VULN: `claim` pays any authorizing caller from reserves with no eligibility
+    // check — the authorized-but-broken-accounting class.
+    #[contract]
+    struct GreedVault;
+    #[contractimpl]
+    impl GreedVault {
+        pub fn __constructor(e: Env, token: Address) {
+            e.storage().instance().set(&GKey::Token, &token);
+        }
+        pub fn claim(e: Env, caller: Address, amount: i128) {
+            caller.require_auth();
+            let t: Address = e.storage().instance().get(&GKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &caller, &amount);
+        }
+    }
+
+    // CORRECT: `withdraw` is gated on the caller's recorded deposit; a fresh
+    // attacker has none, so it reverts and pays nothing.
+    #[contract]
+    struct SafeVault;
+    #[contractimpl]
+    impl SafeVault {
+        pub fn __constructor(e: Env, token: Address) {
+            e.storage().instance().set(&GKey::Token, &token);
+        }
+        pub fn withdraw(e: Env, caller: Address, amount: i128) {
+            caller.require_auth();
+            let bal: i128 = e.storage().persistent().get(&caller).unwrap_or(0);
+            if amount > bal {
+                panic!("insufficient deposit");
+            }
+            let t: Address = e.storage().instance().get(&GKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &caller, &amount);
+        }
+    }
+
+    fn make_token(env: &Env) -> Address {
+        let issuer = Address::generate(env);
+        env.register_stellar_asset_contract_v2(issuer).address()
+    }
+
+    fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
+        token::StellarAssetClient::new(env, token).mint(to, &amount);
+    }
+
+    fn plan(name: &str) -> FnPlan {
+        FnPlan {
+            name: name.into(),
+            inputs: std::vec!["address".into(), "i128".into()],
+            synthesizable: true,
+            skip_reason: None,
+        }
+    }
+
+    // The pair brackets the behavior: a stub returning None fails the recall
+    // test, a stub returning Some fails the precision test — only a detector that
+    // actually discriminates payout-from-zero passes both.
+    #[test]
+    fn greed_flags_unchecked_payout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token_addr = make_token(&env);
+        let vault = env.register(GreedVault, (token_addr.clone(),));
+        mint(&env, &token_addr, &vault, 1_000);
+
+        let contract = addr_to_str(&vault).unwrap();
+        let tokens = std::vec![addr_to_str(&token_addr).unwrap()];
+        let v = greed_check_in_env(&env, &contract, &tokens, &plan("claim"));
+        assert!(v.is_some(), "greed detector must flag unchecked claim payout");
+        assert_eq!(v.unwrap().verdict, "greed");
+    }
+
+    #[test]
+    fn greed_silent_on_correct_vault() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token_addr = make_token(&env);
+        let vault = env.register(SafeVault, (token_addr.clone(),));
+        mint(&env, &token_addr, &vault, 1_000);
+
+        let contract = addr_to_str(&vault).unwrap();
+        let tokens = std::vec![addr_to_str(&token_addr).unwrap()];
+        let v = greed_check_in_env(&env, &contract, &tokens, &plan("withdraw"));
+        assert!(v.is_none(), "greed detector must NOT flag a correctly-gated withdraw");
+    }
 }
