@@ -532,8 +532,22 @@ fn roundtrip_check_in_env(env: &Env, contract: &str, tokens: &[String], f: &FnPl
     let amt = ROUNDTRIP_START / 2;
     let fa = synth_oracle_args(env, &f.inputs, usize::MAX, &attacker, &attacker, amt)?;
     let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &f.name), fa);
+    let auths_f = env.auths();
     let ga = synth_oracle_args(env, &g.inputs, usize::MAX, &attacker, &attacker, amt)?;
     let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &g.name), ga);
+    let auths_g = env.auths();
+    // Corroborate: mock_all_auths lets sub-invocations (the attacker's own token
+    // transfers) work, but it also fakes a privileged signature. A real round-trip is
+    // one a NORMAL user can do — every required auth must be the attacker's own (or the
+    // contract's). If an admin/factory/other address had to authorize, the "profit"
+    // only came from faking that signer (the collect_protocol / fee-collect FP class).
+    let self_only = auths_f
+        .iter()
+        .chain(auths_g.iter())
+        .all(|(a, _)| *a == attacker || *a == caddr);
+    if !self_only {
+        return None;
+    }
     // net gain: some reserve token ended higher, and none ended lower (no offset)
     let mut gained = 0i128;
     let mut lost = false;
@@ -1615,6 +1629,46 @@ mod roundtrip_tests {
         let contract = addr_to_str(&vault).unwrap();
         let v = roundtrip_check_in_env(&env, &contract, &tokens, &plan("stake"), &plan("unstake"));
         assert!(v.is_none(), "must NOT flag a value-conserving stake/unstake");
+    }
+
+    #[contracttype]
+    enum AKey {
+        Token,
+        Admin,
+    }
+
+    // ADMIN-gated fee collect: `collect` pays the recipient from reserves but only
+    // the stored admin may authorize. Under mock_all_auths the admin signature is
+    // faked and the attacker "profits" — the exact false positive the CC22BLZ
+    // collect_protocol hit was. The env.auths() corroboration must silence it.
+    #[contract]
+    struct AdminCollectVault;
+    #[contractimpl]
+    impl AdminCollectVault {
+        pub fn __constructor(e: Env, token: Address, admin: Address) {
+            e.storage().instance().set(&AKey::Token, &token);
+            e.storage().instance().set(&AKey::Admin, &admin);
+        }
+        pub fn collect(e: Env, recipient: Address, amount: i128) {
+            let admin: Address = e.storage().instance().get(&AKey::Admin).unwrap();
+            admin.require_auth();
+            let t: Address = e.storage().instance().get(&AKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &recipient, &amount);
+        }
+    }
+
+    #[test]
+    fn roundtrip_silent_on_admin_gated_collect() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token = make_token(&env);
+        let admin = Address::generate(&env);
+        let vault = env.register(AdminCollectVault, (token.clone(), admin));
+        mint(&env, &token, &vault, 10_000_000);
+        let tokens = std::vec![addr_to_str(&token).unwrap()];
+        let contract = addr_to_str(&vault).unwrap();
+        let v = roundtrip_check_in_env(&env, &contract, &tokens, &plan("collect"), &plan("collect"));
+        assert!(v.is_none(), "auths corroboration must silence an admin-gated collect (the CC22BLZ FP)");
     }
 }
 
