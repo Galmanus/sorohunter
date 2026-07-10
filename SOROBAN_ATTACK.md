@@ -32,10 +32,10 @@ executed proof — a code invariant in the harness, not a promise.
 | Reconnaissance | Initial Access | Privilege Escalation | Persistence | Auth-Bypass / Evasion | Resource / Storage | Cryptographic Failure | Impact |
 |---|---|---|---|---|---|---|---|
 | TR-01 ABI/WASM acquire | **TA-01 missing `require_auth`** ✅ | **TE-01 admin capture→drain** ✅ | **TP-01 unprotected upgrade** ✅ | TD-01 auth-subject confusion | TS-01 TTL/archival assumption | TZ-01 underconstrained circuit | OBJ-DRAIN |
-| TR-02 classify contract | TA-02 unprotected admin setter | TE-02 allowlist/registry poison | TP-02 admin seize+lock | TD-02 cross-contract auth propagation | TS-02 storage-exhaustion / TTL-bump grief | TZ-02 Fr modular-reduction bypass | OBJ-MINT |
+| TR-02 classify contract | **TA-02 unprotected admin setter** ✅ | TE-02 allowlist/registry poison | TP-02 admin seize+lock | TD-02 cross-contract auth propagation | TS-02 storage-exhaustion / TTL-bump grief | TZ-02 Fr modular-reduction bypass | OBJ-MINT |
 | TR-03 state/role map | TA-03 initializer re-entry | TE-03 oracle/config poison | | | TM-01 unchecked `i128` arithmetic | TZ-03 trusted-setup / VK misuse | OBJ-BRICK |
 | TR-04 dep & upgrade-hook discovery | TA-04 auth-arg scope mismatch | | | | | TZ-04 Fiat-Shamir / proof-replay | OBJ-SEIZE |
-| | TA-05 caller-supplied-address trust | | | | | | OBJ-CENSOR |
+| | **TA-05 caller-supplied-address trust** ✅ | | | | | | OBJ-CENSOR |
 
 ✅ = sorohunter ships a fork-validated detector today. All others: roadmap (mechanical) or manual (cryptographic/business-logic).
 
@@ -51,10 +51,10 @@ executed proof — a code invariant in the harness, not a promise.
 
 ### Initial Access — the unauthorized state transition (the foothold)
 - **TA-01 missing `require_auth` on a state mutation** — the #1 Soroban footgun; EVM analog SWC-105 / OWASP-SC "access control." A mutation succeeds under empty auth. *Detector: fork-invoke under empty auth, event/state delta > 0 → BREACH.* **sorohunter: SHIPPED.**
-- **TA-02 unprotected admin setter** — `set_admin` / `transfer_ownership` / `add_allowlist` reachable under empty/weak auth. Fork-detectable. Roadmap.
+- **TA-02 unprotected admin setter** — `set_admin` / `transfer_ownership` / `add_allowlist` reachable under empty/weak auth. Fork-detectable. **sorohunter: SHIPPED** (`probe_hijack`, `hijack` verdict — injects the attacker under empty auth and reads the admin getter before/after; catches silent setters the event-delta `breach` probe misses; proven live on the `admin_capture` testnet fixture).
 - **TA-03 initializer re-entry** — un-guarded `initialize` / `__constructor` re-sets admin. Classic Soroban re-init. Fork-detectable. Roadmap.
 - **TA-04 auth-arg scope mismatch** — `require_auth` present but `require_auth_for_args` scope does not bind the sensitive args. Fork-detectable with arg-mutation. Roadmap.
-- **TA-05 caller-supplied-address trust** — contract acts on an address/token the attacker passes without binding auth to it. Anchor: prompt-injection-into-authorized-payment class (Bankr/Grok ~$150-180K, MCP router drain $500K — the agent *was* authorized). Fork-detectable. Roadmap.
+- **TA-05 caller-supplied-address trust** — contract acts on an address/token the attacker passes without binding auth to it. Anchor: prompt-injection-into-authorized-payment class (Bankr/Grok ~$150-180K, MCP router drain $500K — the agent *was* authorized). Fork-detectable. **sorohunter: SHIPPED** (`probe_redirect`, `redirect` verdict — decoupled authorizer/recipient injection: one scoped-auth caller, attacker as unbound recipient; orthogonal to `greed` by the self-pay guard; proven live on the `redirect_vault` testnet fixture).
 
 ### Privilege Escalation / Composition — the actual chain
 - **TE-01 admin capture → privileged drain/mint** — TA-02 foothold, then invoke the legit admin-only path; both steps executed in one fork. *Detector: the harness proposes candidate chains (address-setter × held-gate) and confirms by execution — validated on `chain_vault` (drained) vs `safe_chain_vault` (foothold gated → not flagged), 0 false positives.* **sorohunter: SHIPPED.**
@@ -90,8 +90,11 @@ Every confirmed chain terminates in a realized, fork-executed objective attached
 
 sorohunter is the executable substrate: for every mechanical technique it aims
 to ship a fork-validated detector so a finding is an executed transition, never
-an inferred one. Today: **3 detectors shipped — TA-01 (missing-auth), TE-01
-(composition chain), TP-01 (unprotected upgrade)**, ground-truth-measured; the rest are the roadmap,
+an inferred one. Today: **7 detectors shipped — TA-01 (missing-auth), TE-01
+(composition chain), TP-01 (unprotected upgrade), OBJ-DRAIN (unauthenticated
+economic drain), OBJ-GREED (authorized-but-unearned payout), TA-02 (admin
+capture), TA-05 (injected-recipient / caller-supplied-address trust)**,
+ground-truth-measured; the rest are the roadmap,
 sequenced by prevalence (Access → Composition → Persistence → Storage). The
 cryptographic tactic is deliberately marked manual —
 that is ZK-review work (Manuel's slippay-zk / verifier-audit lane), not fork-sim,
