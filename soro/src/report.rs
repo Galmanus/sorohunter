@@ -20,6 +20,7 @@ pub fn mark(verdict: &str) -> &'static str {
         "chain" => "CHAIN",
         "hijack" => "HIJACK",
         "reinit" => "REINIT",
+        "drain" => "DRAIN",
         "init-guarded" => "init-guarded",
         "held" => "held",
         "view" => "view",
