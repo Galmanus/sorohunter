@@ -13,6 +13,7 @@
 
 mod abi;
 mod engine;
+mod fork;
 mod report;
 mod rpc;
 
@@ -124,21 +125,16 @@ fn network_id(network: &str) -> [u8; 32] {
 fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
     let url = rpc::rpc_url(network);
     let verdicts = if fork {
-        eprintln!("acquiring {} ({}) — STATE-FORK via RPC (real on-chain state) ...", id, network);
-        let (seq, proto) = match rpc::latest_ledger(url) {
+        eprintln!("acquiring {} ({}) — STATE-FORK via RPC (real full on-chain state, lazy) ...", id, network);
+        let (seq, _proto) = match rpc::latest_ledger(url) {
             Some(x) => x,
             None => {
                 eprintln!("getLatestLedger failed");
                 return 1;
             }
         };
-        let entries = match rpc::fetch_snapshot_entries(url, id) {
-            Some(e) => e,
-            None => {
-                eprintln!("could not fetch contract state via RPC");
-                return 1;
-            }
-        };
+        // fetch the wasm once for the ABI; the lazy source pulls code + real
+        // state (balances, reserves, config) on demand during each probe.
         let wasm = match rpc::fetch_wasm(url, id) {
             Some(w) => w,
             None => {
@@ -147,9 +143,8 @@ fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
             }
         };
         let plan = abi::plan_from_wasm(&wasm);
-        let _ = proto; // mainnet's live protocol (e.g. 27) may exceed the host's
-        let snapshot = soroban_ledger_snapshot::LedgerSnapshot {
-            // stamp with the host's own protocol so it accepts the snapshot.
+        let li = soroban_sdk::testutils::LedgerInfo {
+            // stamp with the host's own protocol (mainnet's live one may be newer).
             protocol_version: engine::host_protocol_version(),
             sequence_number: seq,
             timestamp: 0,
@@ -158,9 +153,9 @@ fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
             min_persistent_entry_ttl: 1,
             min_temp_entry_ttl: 1,
             max_entry_ttl: 6_312_000,
-            ledger_entries: entries,
         };
-        engine::probe_forked(&snapshot, id, &plan)
+        let source = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+        engine::probe_forked_lazy(source, &li, id, &plan)
     } else {
         eprintln!("acquiring {} ({}) — read-only via RPC ...", id, network);
         let wasm = match rpc::fetch_wasm(url, id) {

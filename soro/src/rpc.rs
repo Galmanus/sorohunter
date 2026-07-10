@@ -66,6 +66,14 @@ fn make_entry(data: LedgerEntryData, last_modified: u32) -> LedgerEntry {
     LedgerEntry { last_modified_ledger_seq: last_modified, data, ext: LedgerEntryExt::V0 }
 }
 
+/// Fetch a single ledger entry by its pre-encoded (base64) key — the on-demand
+/// call the lazy fork's SnapshotSource makes for each key the contract reads.
+pub fn fetch_entry(url: &str, key_b64: &str) -> Option<(LedgerEntry, Option<u32>)> {
+    let (xdr, lm, lu) = get_entries_full(url, &[key_b64.to_string()])?.into_iter().next()?;
+    let data = LedgerEntryData::from_xdr_base64(&xdr, Limits::none()).ok()?;
+    Some((make_entry(data, lm), lu))
+}
+
 /// Fetch the contract's instance + code entries as full `LedgerEntry`s for a
 /// minimal state-fork: the instance carries the real admin/config storage, the
 /// code is the WASM. Enough to probe against real auth state (not per-address

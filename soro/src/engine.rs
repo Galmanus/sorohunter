@@ -9,14 +9,19 @@
 //! touches a live network.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::rc::Rc;
 
 use soroban_ledger_snapshot::LedgerSnapshot;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
+    testutils::{
+        Address as _, Events as _, LedgerInfo, MockAuth, MockAuthInvoke, SnapshotSource,
+        SnapshotSourceInput,
+    },
     Address, Bytes, Env, IntoVal, String as SString, Symbol, Val, Vec as SVec,
 };
 
 use crate::abi::FnPlan;
+use crate::fork::RpcSnapshotSource;
 
 #[derive(Debug, Clone)]
 pub struct Verdict {
@@ -271,6 +276,62 @@ pub fn probe_forked(snapshot: &LedgerSnapshot, contract_id: &str, plan: &[FnPlan
 
 fn probe_one_forked(snapshot: &LedgerSnapshot, contract_id: &str, name: &str, types: &[String]) -> (String, i64, String) {
     let env = Env::from_ledger_snapshot(snapshot.clone());
+    let addr = Address::from_string(&SString::from_str(&env, contract_id));
+    let args = match build_args(&env, types, None) {
+        Some(a) => a,
+        None => return ("skipped".into(), 0, "unsynthesizable arg".into()),
+    };
+    env.set_auths(&[]);
+    let before = env.events().all().events().len() as i64;
+    let res = env.try_invoke_contract::<Val, soroban_sdk::Error>(&addr, &Symbol::new(&env, name), args);
+    let after = env.events().all().events().len() as i64;
+    let delta = after - before;
+    match res {
+        Err(_) => ("held".into(), delta, "aborted under empty auth (real forked state)".into()),
+        Ok(_) if delta > 0 => (
+            "breach".into(),
+            delta,
+            "CONFIRMED against real forked state: state change + event under empty auth — missing auth".into(),
+        ),
+        Ok(_) => ("view".into(), delta, "succeeded, no event — read-only".into()),
+    }
+}
+
+/// Probe against the contract's REAL full on-chain state, pulled lazily via RPC
+/// (balances, reserves, config — not just instance storage). This is the mode
+/// for economic bugs: the fork sees real liquidity. A breach here is CONFIRMED.
+pub fn probe_forked_lazy(source: Rc<RpcSnapshotSource>, ledger_info: &LedgerInfo, contract_id: &str, plan: &[FnPlan]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    for p in plan.iter().filter(|p| p.name != "__constructor") {
+        if !p.synthesizable {
+            out.push(Verdict {
+                fn_name: p.name.clone(),
+                arg_types: p.inputs.join(","),
+                verdict: "skipped".into(),
+                events_delta: 0,
+                detail: p.skip_reason.clone().unwrap_or_default(),
+            });
+            continue;
+        }
+        let (v, d, det) = probe_one_forked_lazy(source.clone(), ledger_info, contract_id, &p.name, &p.inputs);
+        out.push(Verdict {
+            fn_name: p.name.clone(),
+            arg_types: p.inputs.join(","),
+            verdict: v,
+            events_delta: d,
+            detail: det,
+        });
+    }
+    out
+}
+
+fn probe_one_forked_lazy(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract_id: &str, name: &str, types: &[String]) -> (String, i64, String) {
+    let src: Rc<dyn SnapshotSource> = source;
+    let env = Env::from_ledger_snapshot(SnapshotSourceInput {
+        source: src,
+        ledger_info: Some(li.clone()),
+        snapshot: None,
+    });
     let addr = Address::from_string(&SString::from_str(&env, contract_id));
     let args = match build_args(&env, types, None) {
         Some(a) => a,
