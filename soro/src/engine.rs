@@ -33,7 +33,7 @@ pub struct Verdict {
 }
 
 /// Verdicts that count as a real finding (mirrors report.FINDING_VERDICTS).
-pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit"];
+pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain"];
 
 /// The protocol version this SDK's host runs at — stamp a state-fork snapshot
 /// with it so the host accepts it (mainnet's live protocol may be newer).
@@ -351,4 +351,66 @@ fn probe_one_forked_lazy(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contrac
         ),
         Ok(_) => ("view".into(), delta, "succeeded, no event — read-only".into()),
     }
+}
+
+/// Build a fork Env from the lazy RPC source + ledger info.
+pub fn forked_env(source: Rc<RpcSnapshotSource>, ledger_info: &LedgerInfo) -> Env {
+    let src: Rc<dyn SnapshotSource> = source;
+    Env::from_ledger_snapshot(SnapshotSourceInput {
+        source: src,
+        ledger_info: Some(ledger_info.clone()),
+        snapshot: None,
+    })
+}
+
+/// Read `token.balance(holder)` in the given env. None if it is not a token or
+/// has no `balance` function.
+pub fn token_balance(env: &Env, token: &str, holder: &str) -> Option<i128> {
+    let taddr = Address::from_string(&SString::from_str(env, token));
+    let haddr = Address::from_string(&SString::from_str(env, holder));
+    let mut args = SVec::new(env);
+    args.push_back(haddr.into_val(env));
+    match env.try_invoke_contract::<i128, soroban_sdk::Error>(&taddr, &Symbol::new(env, "balance"), args) {
+        Ok(Ok(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Economic drain detector: for each mutating fn, probe it under EMPTY auth
+/// against real forked reserves and check if the contract's real token balance
+/// DROPPED. A drop under empty auth = unauthenticated value extraction from real
+/// liquidity — a CONFIRMED economic drain. Fns that require auth revert, so their
+/// reserves are unchanged and they are not flagged.
+pub fn probe_drain(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &str, tokens: &[String], plan: &[FnPlan]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    for p in plan.iter().filter(|p| p.synthesizable && !p.inputs.is_empty() && p.name != "__constructor") {
+        let env = forked_env(source.clone(), li);
+        let attacker = Address::generate(&env);
+        let caddr = Address::from_string(&SString::from_str(&env, contract));
+        let before: Vec<Option<i128>> = tokens.iter().map(|t| token_balance(&env, t, contract)).collect();
+        let args = match build_args(&env, &p.inputs, Some(&attacker)) {
+            Some(a) => a,
+            None => continue,
+        };
+        env.set_auths(&[]);
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(&env, &p.name), args);
+        for (i, t) in tokens.iter().enumerate() {
+            let after = token_balance(&env, t, contract);
+            if let (Some(b), Some(a)) = (before[i], after) {
+                if a < b {
+                    out.push(Verdict {
+                        fn_name: p.name.clone(),
+                        arg_types: p.inputs.join(","),
+                        verdict: "drain".into(),
+                        events_delta: 0,
+                        detail: format!(
+                            "OBJ-DRAIN: {}() under empty auth reduced the contract's real {} balance by {} — unauthenticated value extraction, CONFIRMED against forked state",
+                            p.name, t, b - a
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    out
 }

@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 mod abi;
+mod econ;
 mod engine;
 mod fork;
 mod report;
@@ -187,10 +188,86 @@ fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
     0
 }
 
+/// Spike: identify a contract's tokens and read its REAL holdings in the fork —
+/// the value-measurement primitive the economic drain detector is built on.
+fn cmd_econ(id: &str, network: &str) -> i32 {
+    let url = rpc::rpc_url(network);
+    let seq = match rpc::latest_ledger(url) {
+        Some((s, _)) => s,
+        None => {
+            eprintln!("getLatestLedger failed");
+            return 1;
+        }
+    };
+    let entries = match rpc::fetch_snapshot_entries(url, id) {
+        Some(e) => e,
+        None => {
+            eprintln!("could not fetch instance via RPC");
+            return 1;
+        }
+    };
+    let wasm = match rpc::fetch_wasm(url, id) {
+        Some(w) => w,
+        None => {
+            eprintln!("could not fetch wasm via RPC");
+            return 1;
+        }
+    };
+    let plan = abi::plan_from_wasm(&wasm);
+    let li = soroban_sdk::testutils::LedgerInfo {
+        protocol_version: engine::host_protocol_version(),
+        sequence_number: seq,
+        timestamp: 0,
+        network_id: network_id(network),
+        base_reserve: 0,
+        min_persistent_entry_ttl: 1,
+        min_temp_entry_ttl: 1,
+        max_entry_ttl: 6_312_000,
+    };
+    let source = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+    let env = engine::forked_env(source, &li);
+    let tokens = econ::candidate_tokens(&env, id, entries[0].1 .0.as_ref(), &plan);
+    eprintln!("candidate tokens (instance + getters): {:?}", tokens);
+    println!("\n{} — token holdings (real forked state):", id);
+    for t in &tokens {
+        match engine::token_balance(&env, t, id) {
+            Some(b) => println!("  holds {:>22} of {}", b, t),
+            None => println!("  {}  (not a token / no balance())", t),
+        }
+    }
+
+    let n_mut = plan.iter().filter(|p| p.synthesizable && !p.inputs.is_empty()).count();
+    let source2 = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+    let drains = engine::probe_drain(source2, &li, id, &tokens, &plan);
+    println!("\n=== economic drain probe ({} mutating fns, empty auth, real reserves) ===", n_mut);
+    if drains.is_empty() {
+        println!("  no drain — no mutating fn reduced the contract's real reserves under empty auth.");
+    } else {
+        for d in &drains {
+            println!("  [DRAIN]  {}({})  {}", d.fn_name, d.arg_types, d.detail);
+        }
+    }
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("bench") => cmd_bench(),
+        Some("econ") if args.len() > 1 => {
+            let id = args[1].clone();
+            let mut network = "mainnet".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--network" && i + 1 < args.len() {
+                    network = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            cmd_econ(&id, &network)
+        }
         Some("probe") if args.len() > 1 => cmd_probe(&args[1..]),
         Some("scan") if args.len() > 1 => {
             let id = args[1].clone();
