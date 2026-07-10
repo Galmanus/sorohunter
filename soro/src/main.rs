@@ -26,6 +26,7 @@ use serde_json::Value;
 /// The attacker payload for the upgrade detector, embedded so the binary is
 /// self-contained.
 const ATTACKER: &[u8] = include_bytes!("../assets/attacker_pwn.wasm");
+const LIAR_ORACLE: &[u8] = include_bytes!("../assets/liar_oracle.wasm");
 
 fn probe_wasm_file(path: &str) -> Vec<engine::Verdict> {
     let wasm = std::fs::read(path).unwrap_or_default();
@@ -324,6 +325,21 @@ fn cmd_econ(id: &str, network: &str) -> i32 {
     } else {
         for r in &redirect {
             println!("  [REDIRECT]  {}({})  {}", r.fn_name, r.arg_types, r.detail);
+        }
+    }
+
+    // Oracle-lie: the contract trusts the return value of a caller-supplied
+    // contract (price oracle / token) without validating its identity. Differential
+    // probe — honest price vs a huge lie; a payout that scales with the lie is a
+    // confirmed unvalidated-oracle trust ("everything that communicates is surface").
+    let source5 = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+    let oracle = engine::probe_oracle_lie(source5, &li, id, &tokens, &plan, LIAR_ORACLE);
+    println!("\n=== oracle-lie probe ({} address-taking fns, planted liar oracle) ===", n_multi);
+    if oracle.is_empty() {
+        println!("  no oracle-lie — no fn paid more when a caller-supplied contract lied about a price.");
+    } else {
+        for o in &oracle {
+            println!("  [ORACLE]  {}({})  {}", o.fn_name, o.arg_types, o.detail);
         }
     }
     0

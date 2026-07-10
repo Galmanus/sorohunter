@@ -33,7 +33,7 @@ pub struct Verdict {
 }
 
 /// Verdicts that count as a real finding (mirrors report.FINDING_VERDICTS).
-pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed", "redirect", "replay"];
+pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed", "redirect", "replay", "oracle"];
 
 /// The protocol version this SDK's host runs at — stamp a state-fork snapshot
 /// with it so the host accepts it (mainnet's live protocol may be newer).
@@ -855,6 +855,212 @@ mod hijack_tests {
     }
 }
 
+/// Build args for the oracle-lie probe: the planted oracle at `oracle_idx`, the
+/// attacker at every other address slot, and a LARGE value in numeric slots (so a
+/// payout gated on the oracle only clears under the inflated price, exposing the
+/// differential). Non-address, non-numeric args get their default synth.
+fn synth_oracle_args(
+    env: &Env,
+    types: &[String],
+    oracle_idx: usize,
+    oracle: &Address,
+    attacker: &Address,
+    amount: i128,
+) -> Option<SVec<Val>> {
+    let mut args = SVec::new(env);
+    for (i, t) in types.iter().enumerate() {
+        let v = if t == "address" {
+            if i == oracle_idx { oracle.clone().into_val(env) } else { attacker.clone().into_val(env) }
+        } else if t == "i128" {
+            amount.into_val(env)
+        } else if t == "u128" {
+            (amount as u128).into_val(env)
+        } else {
+            synth(env, t, None)?
+        };
+        args.push_back(v);
+    }
+    Some(args)
+}
+
+const ORACLE_LIE_AMOUNT: i128 = 1_000_000;
+const ORACLE_HONEST_PRICE: i128 = 1;
+const ORACLE_LIE_PRICE: i128 = 1_000_000_000_000;
+
+/// One oracle-lie run: plant the liar oracle at `oracle_idx` seeded to `price`,
+/// authorize the attacker, invoke the fn, and return the attacker's max gain in
+/// any reserve token (from a fresh zero position).
+fn oracle_run(
+    env: &Env,
+    contract: &str,
+    tokens: &[String],
+    p: &FnPlan,
+    oracle_idx: usize,
+    oracle_wasm: &[u8],
+    price: i128,
+) -> Option<i128> {
+    let oracle = env.register(oracle_wasm, ());
+    env.mock_all_auths();
+    let mut sp = SVec::new(env);
+    sp.push_back(price.into_val(env));
+    let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&oracle, &Symbol::new(env, "set_price"), sp);
+
+    let attacker = Address::generate(env);
+    let attacker_str = addr_to_str(&attacker)?;
+    let args = synth_oracle_args(env, &p.inputs, oracle_idx, &oracle, &attacker, ORACLE_LIE_AMOUNT)?;
+    let before: Vec<Option<i128>> = tokens.iter().map(|t| token_balance(env, t, &attacker_str)).collect();
+    let caddr = Address::from_string(&SString::from_str(env, contract));
+    env.mock_all_auths();
+    let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &p.name), args);
+    let mut max_gain = 0i128;
+    for (i, t) in tokens.iter().enumerate() {
+        if let (Some(b), Some(a)) = (before[i], token_balance(env, t, &attacker_str)) {
+            max_gain = max_gain.max(a - b);
+        }
+    }
+    Some(max_gain)
+}
+
+/// Oracle-lie detector ("everything that communicates is attack surface"): a
+/// contract that trusts the return value of a CALLER-SUPPLIED contract (a price
+/// oracle, a token) without validating its identity. The attacker plants a
+/// contract that lies. Differential probe: run each fn with the planted oracle
+/// reporting an honest price vs a huge one; if the attacker extracts strictly more
+/// reserve under the lie, the contract's payout scales with an unvalidated return
+/// — confirmed price/oracle manipulation. Greed/redirect cannot reach this: a
+/// plain attacker address is not a contract, so a callback into it just reverts.
+pub fn probe_oracle_lie(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &str, tokens: &[String], plan: &[FnPlan], oracle_wasm: &[u8]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    for p in plan.iter().filter(|p| p.synthesizable && p.name != "__constructor" && p.inputs.iter().any(|t| t == "address")) {
+        let addr_idxs: Vec<usize> = p.inputs.iter().enumerate().filter(|(_, t)| *t == "address").map(|(i, _)| i).collect();
+        for &oi in &addr_idxs {
+            let env_h = forked_env(source.clone(), li);
+            let gh = oracle_run(&env_h, contract, tokens, p, oi, oracle_wasm, ORACLE_HONEST_PRICE);
+            let env_l = forked_env(source.clone(), li);
+            let gl = oracle_run(&env_l, contract, tokens, p, oi, oracle_wasm, ORACLE_LIE_PRICE);
+            if let (Some(gh), Some(gl)) = (gh, gl) {
+                if gl > gh {
+                    out.push(Verdict {
+                        fn_name: p.name.clone(),
+                        arg_types: p.inputs.join(","),
+                        verdict: "oracle".into(),
+                        events_delta: 0,
+                        detail: format!(
+                            "OBJ-LIE: {}() paid the attacker {} more of a reserve token when a caller-supplied contract at arg #{} reported a huge price ({}) vs an honest one ({}) — the payout trusts the return value of an unvalidated caller-supplied contract (oracle/price manipulation, no allowlist). CONFIRMED against forked state",
+                            p.name, gl - gh, oi, ORACLE_LIE_PRICE, ORACLE_HONEST_PRICE
+                        ),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, contracttype, token, vec as svec, Address, Env, Symbol};
+
+    const ORACLE_WASM: &[u8] = include_bytes!("../assets/liar_oracle.wasm");
+
+    #[contracttype]
+    enum OKey {
+        Token,
+        Trusted,
+    }
+
+    // VULN: `borrow` lets the caller draw reserves up to a limit read from a
+    // caller-supplied oracle it never validates — an attacker plants a liar.
+    #[contract]
+    struct OracleVault;
+    #[contractimpl]
+    impl OracleVault {
+        pub fn __constructor(e: Env, token: Address) {
+            e.storage().instance().set(&OKey::Token, &token);
+        }
+        pub fn borrow(e: Env, user: Address, oracle: Address, amount: i128) {
+            user.require_auth();
+            let limit: i128 = e.invoke_contract(&oracle, &Symbol::new(&e, "get_price"), svec![&e]);
+            if amount > limit {
+                panic!("over limit");
+            }
+            let t: Address = e.storage().instance().get(&OKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &user, &amount);
+        }
+    }
+
+    // CORRECT: the oracle must equal the trusted one recorded at construction; a
+    // planted liar fails the check and no reserve moves regardless of its price.
+    #[contract]
+    struct TrustedOracleVault;
+    #[contractimpl]
+    impl TrustedOracleVault {
+        pub fn __constructor(e: Env, token: Address, trusted: Address) {
+            e.storage().instance().set(&OKey::Token, &token);
+            e.storage().instance().set(&OKey::Trusted, &trusted);
+        }
+        pub fn borrow(e: Env, user: Address, oracle: Address, amount: i128) {
+            user.require_auth();
+            let trusted: Address = e.storage().instance().get(&OKey::Trusted).unwrap();
+            if oracle != trusted {
+                panic!("untrusted oracle");
+            }
+            let limit: i128 = e.invoke_contract(&oracle, &Symbol::new(&e, "get_price"), svec![&e]);
+            if amount > limit {
+                panic!("over limit");
+            }
+            let t: Address = e.storage().instance().get(&OKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &user, &amount);
+        }
+    }
+
+    fn make_token(env: &Env) -> Address {
+        env.register_stellar_asset_contract_v2(Address::generate(env)).address()
+    }
+    fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {
+        token::StellarAssetClient::new(env, token).mint(to, &amount);
+    }
+    fn plan() -> FnPlan {
+        FnPlan { name: "borrow".into(), inputs: std::vec!["address".into(), "address".into(), "i128".into()], synthesizable: true, skip_reason: None }
+    }
+
+    #[test]
+    fn oracle_lie_flags_unvalidated_oracle() {
+        // fresh env per price — the borrow mutates reserves, so honest and lie runs
+        // must not share state.
+        let gain = |price: i128| -> i128 {
+            let env = Env::default();
+            env.mock_all_auths();
+            let token = make_token(&env);
+            let vault = env.register(OracleVault, (token.clone(),));
+            mint(&env, &token, &vault, 10_000_000);
+            let tokens = std::vec![addr_to_str(&token).unwrap()];
+            oracle_run(&env, &addr_to_str(&vault).unwrap(), &tokens, &plan(), 1, ORACLE_WASM, price).unwrap()
+        };
+        let honest = gain(ORACLE_HONEST_PRICE);
+        let lie = gain(ORACLE_LIE_PRICE);
+        assert!(lie > honest, "liar oracle must let the attacker draw more than an honest one (got lie={} honest={})", lie, honest);
+    }
+
+    #[test]
+    fn oracle_lie_silent_on_trusted_oracle() {
+        let gain = |price: i128| -> i128 {
+            let env = Env::default();
+            env.mock_all_auths();
+            let token = make_token(&env);
+            let trusted = Address::generate(&env);
+            let vault = env.register(TrustedOracleVault, (token.clone(), trusted));
+            mint(&env, &token, &vault, 10_000_000);
+            let tokens = std::vec![addr_to_str(&token).unwrap()];
+            oracle_run(&env, &addr_to_str(&vault).unwrap(), &tokens, &plan(), 1, ORACLE_WASM, price).unwrap()
+        };
+        assert_eq!(gain(ORACLE_LIE_PRICE), gain(ORACLE_HONEST_PRICE),
+            "a trusted-oracle check must make the planted liar inert at any price");
+    }
+}
+
 /// Archival-replay (temporal) attack — a class EVM-derived tooling cannot model,
 /// because EVM storage never expires. A one-shot guard (a "claimed"/"used"/nonce
 /// flag) stored in TEMPORARY storage evaporates when its TTL lapses, and the next
@@ -921,7 +1127,7 @@ pub fn probe_replay(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &s
 #[cfg(test)]
 mod replay_tests {
     use super::*;
-    use soroban_sdk::testutils::{Ledger as _, LedgerInfo};
+    use soroban_sdk::testutils::LedgerInfo;
     use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
     #[contracttype]
