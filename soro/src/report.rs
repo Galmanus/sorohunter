@@ -24,6 +24,7 @@ pub fn mark(verdict: &str) -> &'static str {
         "greed" => "GREED",
         "redirect" => "REDIRECT",
         "replay" => "REPLAY",
+        "oracle" => "ORACLE",
         "init-guarded" => "init-guarded",
         "held" => "held",
         "view" => "view",
