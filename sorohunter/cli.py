@@ -50,22 +50,28 @@ def abi_entries(*info_args: str) -> list[dict]:
 def probe_wasm(wasm_path: str, entries: list[dict], out_json: str) -> list[dict]:
     """Run the harness over the synthesizable functions; fold in skipped ones."""
     plan = parse_spec(entries)
+    # real contracts (Protocol 22+) carry a __constructor: pull its arg types out
+    # to deploy with, and never probe it as an attack surface.
+    ctor = next((p for p in plan if p["name"] == "__constructor"), None)
+    ctor_csv = ",".join(ctor["inputs"]) if (ctor and ctor["synthesizable"]) else ""
+    plan = [p for p in plan if p["name"] != "__constructor"]
     specs = [f"{p['name']}:{','.join(p['inputs'])}" for p in plan if p["synthesizable"]]
     verdicts: list[dict] = []
     if specs:
-        subprocess.run([harness_bin(), wasm_path, out_json, *specs], check=True,
+        subprocess.run([harness_bin(), wasm_path, out_json, ctor_csv, *specs], check=True,
                        capture_output=True, text=True)
         verdicts = json.load(open(out_json))
     for p in plan:
         if not p["synthesizable"]:
             verdicts.append({"fn": p["name"], "arg_types": ",".join(p["inputs"]),
                              "verdict": "skipped", "events_delta": 0, "detail": p["skip_reason"]})
-    verdicts += probe_chains(wasm_path, plan, verdicts, out_json)
-    verdicts += probe_upgrades(wasm_path, plan, out_json)
+    verdicts += probe_chains(wasm_path, plan, verdicts, out_json, ctor_csv)
+    verdicts += probe_upgrades(wasm_path, plan, out_json, ctor_csv)
     return verdicts
 
 
-def probe_upgrades(wasm_path: str, plan: list[dict], out_json: str) -> list[dict]:
+def probe_upgrades(wasm_path: str, plan: list[dict], out_json: str,
+                   ctor_csv: str = "") -> list[dict]:
     """Fork-validate unprotected-upgrade hijacks (TP-01).
 
     Candidate upgrade entry points are functions taking a 32-byte hash
@@ -83,7 +89,7 @@ def probe_upgrades(wasm_path: str, plan: list[dict], out_json: str) -> list[dict
         if not p["synthesizable"] or "bytes_n:32" not in p["inputs"]:
             continue
         spec = f"{p['name']}:{','.join(p['inputs'])}"
-        subprocess.run([harness_bin(), "--upgrade", wasm_path, ATTACKER_WASM, up_out, spec],
+        subprocess.run([harness_bin(), "--upgrade", wasm_path, ATTACKER_WASM, up_out, ctor_csv, spec],
                        check=True, capture_output=True, text=True)
         res = json.load(open(up_out))
         if res.get("verdict") == "hijack":
@@ -94,7 +100,7 @@ def probe_upgrades(wasm_path: str, plan: list[dict], out_json: str) -> list[dict
 
 
 def probe_chains(wasm_path: str, plan: list[dict], verdicts: list[dict],
-                 out_json: str) -> list[dict]:
+                 out_json: str, ctor_csv: str = "") -> list[dict]:
     """Propose and fork-validate two-step privilege chains (TE-01 / SK-C01).
 
     Candidate footholds are synthesizable functions that take an address (a
@@ -116,7 +122,7 @@ def probe_chains(wasm_path: str, plan: list[dict], verdicts: list[dict],
                 continue
             f_spec = f"{fh['name']}:{','.join(fh['inputs'])}"
             t_spec = f"{tgt}:{','.join(inputs_by_name.get(tgt, []))}"
-            subprocess.run([harness_bin(), "--chain", wasm_path, chain_out, f_spec, t_spec],
+            subprocess.run([harness_bin(), "--chain", wasm_path, chain_out, ctor_csv, f_spec, t_spec],
                            check=True, capture_output=True, text=True)
             res = json.load(open(chain_out))
             if res.get("verdict") == "chain":
@@ -176,6 +182,39 @@ def cmd_scan(args) -> int:
     return 0
 
 
+def cmd_probe(args) -> int:
+    """Run the engine over local contract wasm file(s) — the way to point it at
+    real contracts (e.g. soroban-examples) without a network fetch."""
+    rows = []
+    total_findings = 0
+    for wasm in args.wasm:
+        if not os.path.exists(wasm):
+            print(f"skip (no file): {wasm}")
+            continue
+        label = os.path.splitext(os.path.basename(wasm))[0]
+        entries = abi_entries("--wasm", wasm)
+        if not entries:
+            print(f"skip (no spec): {label}")
+            continue
+        verdicts = probe_wasm(wasm, entries, os.path.join(REPORTS, f"_probe_{label}.json"))
+        findings = [v for v in verdicts if v["verdict"] in ("breach", "chain", "hijack")]
+        total_findings += len(findings)
+        rows.append((label, len(verdicts), findings))
+        if args.verbose or findings:
+            print(f"\n{label}: {len(verdicts)} probes")
+            for v in verdicts:
+                mark = {"breach": "BREACH", "chain": "CHAIN", "hijack": "HIJACK"}.get(
+                    v["verdict"], v["verdict"])
+                print(f"  [{mark:<7}] {v['fn']}({v['arg_types']})  {v['detail']}")
+
+    print("\n=== summary ===")
+    for label, n, findings in rows:
+        flag = ", ".join(f["fn"] for f in findings) or "clean"
+        print(f"  {label:<30} {n:>2} probes  ->  {flag}")
+    print(f"\n{len(rows)} contracts probed, {total_findings} finding(s)")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="sorohunter")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -185,6 +224,10 @@ def main(argv=None) -> int:
     s.add_argument("contract_id")
     s.add_argument("--network", default="testnet")
     s.set_defaults(func=cmd_scan)
+    pr = sub.add_parser("probe", help="run the engine on local contract wasm file(s)")
+    pr.add_argument("wasm", nargs="+")
+    pr.add_argument("-v", "--verbose", action="store_true")
+    pr.set_defaults(func=cmd_probe)
     args = p.parse_args(argv)
     return args.func(args)
 

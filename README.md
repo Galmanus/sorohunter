@@ -8,6 +8,7 @@ with the invocation sequence that produced it as an **executed PoC**. The
 surface no one audits, done the one way that stays legal.
 
 - **Taxonomy:** [`SOROBAN_ATTACK.md`](SOROBAN_ATTACK.md) — tactics × techniques, shipped-vs-roadmap per cell.
+- **Real-world evidence:** [`REAL_WORLD.md`](REAL_WORLD.md) — 0 false positives across 11 real Stellar `soroban-examples`, recall on injected bugs, a live testnet scan.
 - **Design:** [`SPEC.md`](SPEC.md). **A kill chain as a path through the matrix:** [`KILLCHAIN.md`](KILLCHAIN.md).
 
 ## What "fork-validated" means (and why it matters)
@@ -59,8 +60,15 @@ built to earn. The corpus grows with each shipped technique.
 
 ```bash
 python3 -m pytest -q                          # ABI parser + evaluation logic (14 tests)
+python3 sorohunter/cli.py probe path/to/contract.wasm            # run the engine on local wasm file(s)
 python3 sorohunter/cli.py scan <CONTRACT_ID> --network testnet   # read-only acquire + local fork
 ```
+
+Probes deploy real contracts too: the harness synthesizes `__constructor` args
+(Protocol 22+) and a deploy that traps is caught, not fatal. Precision is
+biased over recall by design — crude default args never cry wolf, but can miss a
+bug that needs specific state (see [`REAL_WORLD.md`](REAL_WORLD.md) caveats,
+incl. the unsynthesizable `muxed_address` skip).
 
 ## Design
 
