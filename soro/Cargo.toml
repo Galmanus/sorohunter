@@ -1,0 +1,15 @@
+[package]
+name = "soro"
+version = "0.1.0"
+edition = "2021"
+description = "sorohunter — single-binary Rust consolidation (WIP; replaces the Python orchestration)"
+
+[[bin]]
+name = "sorohunter"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+# soroban-sdk (+ testutils) is added when the fork-sim engine is ported in from
+# ../harness; the ABI module is pure serde_json and needs no soroban dep.
