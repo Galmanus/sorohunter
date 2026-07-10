@@ -14,9 +14,9 @@ import os
 
 
 def _findings(verdicts: list[dict]) -> list[str]:
-    # a finding is a single-fn missing-auth breach (TA-01) or a confirmed
-    # composition chain (TE-01)
-    return [v["fn"] for v in verdicts if v.get("verdict") in ("breach", "chain")]
+    # a finding is a single-fn missing-auth breach (TA-01), a confirmed
+    # composition chain (TE-01), or a confirmed upgrade hijack (TP-01)
+    return [v["fn"] for v in verdicts if v.get("verdict") in ("breach", "chain", "hijack")]
 
 
 def evaluate(results: list[dict], ground_truth: dict[str, list[str]]) -> dict:
@@ -76,7 +76,7 @@ def report_md(ev: dict, results: list[dict]) -> str:
             continue
         L.append(f"\n### {pc['contract']}")
         for v in r["verdicts"]:
-            mark = {"breach": "BREACH", "chain": "CHAIN"}.get(v.get("verdict"), v.get("verdict"))
+            mark = {"breach": "BREACH", "chain": "CHAIN", "hijack": "HIJACK"}.get(v.get("verdict"), v.get("verdict"))
             L.append(f"- **[{mark}] {v['fn']}({v.get('arg_types','')})** — {v.get('detail','')}")
     L.append("")
     L.append("## Reading")

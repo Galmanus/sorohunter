@@ -1,6 +1,6 @@
 {
   "evaluation": {
-    "tp": 2,
+    "tp": 3,
     "fp": 0,
     "fn": 0,
     "precision": 1.0,
@@ -44,6 +44,28 @@
       },
       {
         "contract": "safe_chain_vault",
+        "flagged": [],
+        "expected": [],
+        "tp": [],
+        "fp": [],
+        "fn": []
+      },
+      {
+        "contract": "upgrade_vault",
+        "flagged": [
+          "upgrade"
+        ],
+        "expected": [
+          "upgrade"
+        ],
+        "tp": [
+          "upgrade"
+        ],
+        "fp": [],
+        "fn": []
+      },
+      {
+        "contract": "safe_upgrade_vault",
         "flagged": [],
         "expected": [],
         "tp": [],
@@ -162,6 +184,53 @@
         {
           "fn": "set_admin",
           "arg_types": "address",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        }
+      ]
+    },
+    {
+      "contract": "upgrade_vault",
+      "wasm": "/home/galmanus/sorohunter/bench/target/wasm32v1-none/release/upgrade_vault.wasm",
+      "verdicts": [
+        {
+          "fn": "ping",
+          "arg_types": "",
+          "verdict": "view",
+          "events_delta": 0,
+          "detail": "succeeded, no event \u2014 read-only"
+        },
+        {
+          "fn": "upgrade",
+          "arg_types": "bytes_n:32",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        },
+        {
+          "fn": "upgrade",
+          "arg_types": "bytes_n:32",
+          "verdict": "hijack",
+          "events_delta": 0,
+          "detail": "upgrade() swapped the contract code under empty auth \u2014 the attacker payload now executes (pwned=1337): OBJ-SEIZE, arbitrary control"
+        }
+      ]
+    },
+    {
+      "contract": "safe_upgrade_vault",
+      "wasm": "/home/galmanus/sorohunter/bench/target/wasm32v1-none/release/safe_upgrade_vault.wasm",
+      "verdicts": [
+        {
+          "fn": "ping",
+          "arg_types": "",
+          "verdict": "view",
+          "events_delta": 0,
+          "detail": "succeeded, no event \u2014 read-only"
+        },
+        {
+          "fn": "upgrade",
+          "arg_types": "bytes_n:32",
           "verdict": "held",
           "events_delta": 0,
           "detail": "aborted under empty auth"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vuln_vault", "safe_vault", "chain_vault", "safe_chain_vault"]
+members = ["vuln_vault", "safe_vault", "chain_vault", "safe_chain_vault", "upgrade_vault", "safe_upgrade_vault", "attacker_pwn"]
 
 [workspace.dependencies]
 soroban-sdk = "25.0.1"
