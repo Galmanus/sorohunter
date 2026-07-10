@@ -47,9 +47,9 @@ fn abi_entries(extra: &[&str]) -> Vec<Value> {
 }
 
 fn probe_wasm_file(path: &str) -> Vec<engine::Verdict> {
-    let entries = abi_entries(&["--wasm", path]);
-    let plan = abi::parse_spec(&entries);
     let wasm = std::fs::read(path).unwrap_or_default();
+    // native: parse the ABI straight from the WASM custom section, no CLI.
+    let plan = abi::plan_from_wasm(&wasm);
     engine::probe_contract(&wasm, ATTACKER, &plan)
 }
 
@@ -140,13 +140,13 @@ fn cmd_scan(id: &str, network: &str) -> i32 {
         eprintln!("fetch failed");
         return 1;
     }
-    let entries = abi_entries(&["--id", id, "--network", network]);
-    if entries.is_empty() {
-        eprintln!("no contract spec found");
+    let wasm = std::fs::read(&tmp).unwrap_or_default();
+    // native: ABI from the fetched WASM's custom section (no `info interface`).
+    let plan = abi::plan_from_wasm(&wasm);
+    if plan.is_empty() {
+        eprintln!("no contract spec found in fetched wasm");
         return 1;
     }
-    let plan = abi::parse_spec(&entries);
-    let wasm = std::fs::read(&tmp).unwrap_or_default();
     let verdicts = engine::probe_contract(&wasm, ATTACKER, &plan);
 
     println!("\n{}: {} probes", id, verdicts.len());

@@ -13,3 +13,6 @@ serde_json = "1"
 # testutils is used at RUNTIME here (the fork-sim engine runs contracts in a
 # local Env), not just in tests — same as ../harness.
 soroban-sdk = { version = "25", features = ["testutils"] }
+# native spec-from-wasm: read the contract ABI directly from the WASM custom
+# section, no `stellar contract info interface` shell-out.
+soroban-spec = "25"
