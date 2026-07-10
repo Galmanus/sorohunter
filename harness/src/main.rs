@@ -1,33 +1,23 @@
-//! sorohunter fork-sim harness — generic auth prober + composition prober.
+//! sorohunter fork-sim harness — generic auth prober + composition + upgrade.
 //!
-//! Single-fn mode:  <wasm> <out_json> "<fn>:<t1>,<t2>,..." [more fns...]
-//!   deploy the WASM into a local Env and, for each function, synthesize args
-//!   from the ABI types, invoke under EMPTY auth, classify via an event-diff:
-//!     aborts under empty auth     -> held   (enforces auth)
-//!     succeeds and emits an event -> BREACH (state change without a signature)
-//!     succeeds and emits no event -> view   (read-only; not a finding)
+//! Every mode deploys the target into a local Env and probes it under empty
+//! auth. Real contracts (Protocol 22+) carry a `__constructor` with args, so the
+//! harness synthesizes constructor args and deploys with them; a deploy that
+//! traps (unsynthesizable args, or a validating constructor) is caught, not
+//! fatal. Nothing ever touches a live network.
 //!
-//! Chain mode:      --chain <wasm> <out_json> "<foothold>:<types>" "<target>:<types>"
-//!   executes a two-step privilege chain (TE-01 / SK-C01) in ONE fork:
-//!     1. baseline: target under the attacker's auth, no foothold -> must abort;
-//!        if it succeeds, the target is directly attacker-callable ("direct",
-//!        single-technique, not a chain).
-//!     2. foothold: invoke the setter under EMPTY auth, its address arg set to
-//!        the attacker -> if it aborts, "no-foothold".
-//!     3. target: invoke under the attacker's auth only -> if it now succeeds
-//!        and emits an event, the chain is CONFIRMED ("chain").
-//!
-//! Nothing here ever touches a live network: every invocation is in-process
-//! against a local ledger.
+//! Single-fn mode:  <wasm> <out_json> <ctor_csv> "<fn>:<types>" [more fns...]
+//! Chain mode:      --chain <wasm> <out_json> <ctor_csv> "<foothold>:<t>" "<target>:<t>"
+//! Upgrade mode:    --upgrade <wasm> <attacker_wasm> <out_json> <ctor_csv> "<fn>:<t>"
+//! (ctor_csv is the constructor's arg types, comma-separated, or "" for none.)
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use soroban_sdk::{
     testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
     Address, Bytes, Env, IntoVal, String as SString, Symbol, Val, Vec as SVec,
 };
 
-/// Synthesize a `Val` for an ABI type. If `attacker` is set, `address` args
-/// resolve to it (so a foothold's new-admin arg and the target's auth subject
-/// are the same principal); otherwise a fresh address is generated.
 fn synth(env: &Env, t: &str, attacker: Option<&Address>) -> Option<Val> {
     if t == "address" {
         return Some(match attacker {
@@ -63,25 +53,47 @@ fn build_args(env: &Env, types: &[String], attacker: Option<&Address>) -> Option
     Some(args)
 }
 
+/// Deploy the wasm, synthesizing constructor args from `ctor_types`. Returns
+/// None if the args can't be synthesized or the constructor traps.
+fn try_deploy(env: &Env, wasm: &[u8], ctor_types: &[String]) -> Option<Address> {
+    let args = build_args(env, ctor_types, None)?;
+    let empty = ctor_types.is_empty();
+    let wasm = wasm.to_vec();
+    catch_unwind(AssertUnwindSafe(move || {
+        if empty {
+            env.register(wasm.as_slice(), ())
+        } else {
+            env.register(wasm.as_slice(), args)
+        }
+    }))
+    .ok()
+}
+
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn split_spec(spec: &str) -> (String, Vec<String>) {
     let (name, csv) = spec.split_once(':').unwrap_or((spec, ""));
-    let types = if csv.is_empty() {
+    (name.to_string(), csv_types(csv))
+}
+
+fn csv_types(csv: &str) -> Vec<String> {
+    if csv.is_empty() {
         Vec::new()
     } else {
         csv.split(',').map(|s| s.to_string()).collect()
-    };
-    (name.to_string(), types)
+    }
 }
 
 /// Probe one function in a fresh Env so probes never contaminate each other.
-fn probe(wasm: &[u8], name: &str, types: &[String]) -> (String, i64, String) {
+fn probe(wasm: &[u8], ctor: &[String], name: &str, types: &[String]) -> (String, i64, String) {
     let env = Env::default();
     env.mock_all_auths(); // deploy freely
-    let cid = env.register(wasm, ());
+    let cid = match try_deploy(&env, wasm, ctor) {
+        Some(c) => c,
+        None => return ("deploy-failed".into(), 0, "could not deploy (constructor args unsynthesizable or deploy trapped)".into()),
+    };
 
     let args = match build_args(&env, types, None) {
         Some(a) => a,
@@ -108,6 +120,7 @@ fn probe(wasm: &[u8], name: &str, types: &[String]) -> (String, i64, String) {
 /// Execute a two-step privilege chain (TE-01 / SK-C01) in one fork.
 fn probe_chain(
     wasm: &[u8],
+    ctor: &[String],
     foothold: &str,
     f_types: &[String],
     target: &str,
@@ -117,7 +130,10 @@ fn probe_chain(
     {
         let env = Env::default();
         env.mock_all_auths();
-        let cid = env.register(wasm, ());
+        let cid = match try_deploy(&env, wasm, ctor) {
+            Some(c) => c,
+            None => return ("deploy-failed".into(), "could not deploy".into()),
+        };
         let attacker = Address::generate(&env);
         let args = match build_args(&env, t_types, Some(&attacker)) {
             Some(a) => a,
@@ -126,12 +142,7 @@ fn probe_chain(
         env.set_auths(&[]);
         env.mock_auths(&[MockAuth {
             address: &attacker,
-            invoke: &MockAuthInvoke {
-                contract: &cid,
-                fn_name: target,
-                args: args.clone(),
-                sub_invokes: &[],
-            },
+            invoke: &MockAuthInvoke { contract: &cid, fn_name: target, args: args.clone(), sub_invokes: &[] },
         }]);
         let r = env.try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, target), args);
         if r.is_ok() {
@@ -145,14 +156,17 @@ fn probe_chain(
     // 2+3. foothold under empty auth, then target under the attacker's auth.
     let env = Env::default();
     env.mock_all_auths();
-    let cid = env.register(wasm, ());
+    let cid = match try_deploy(&env, wasm, ctor) {
+        Some(c) => c,
+        None => return ("deploy-failed".into(), "could not deploy".into()),
+    };
     let attacker = Address::generate(&env);
 
     let f_args = match build_args(&env, f_types, Some(&attacker)) {
         Some(a) => a,
         None => return ("skipped".into(), "unsynthesizable foothold arg".into()),
     };
-    env.set_auths(&[]); // foothold must land with NO signature
+    env.set_auths(&[]);
     let fr = env.try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, foothold), f_args);
     if fr.is_err() {
         return ("no-foothold".into(), "foothold aborts under empty auth (setter is gated)".into());
@@ -165,12 +179,7 @@ fn probe_chain(
     let before = env.events().all().events().len() as i64;
     env.mock_auths(&[MockAuth {
         address: &attacker,
-        invoke: &MockAuthInvoke {
-            contract: &cid,
-            fn_name: target,
-            args: t_args.clone(),
-            sub_invokes: &[],
-        },
+        invoke: &MockAuthInvoke { contract: &cid, fn_name: target, args: t_args.clone(), sub_invokes: &[] },
     }]);
     let tr = env.try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, target), t_args);
     let after = env.events().all().events().len() as i64;
@@ -183,25 +192,24 @@ fn probe_chain(
                 foothold, target
             ),
         ),
-        _ => (
-            "held-after-foothold".into(),
-            "foothold established but target still not reachable by the attacker".into(),
-        ),
+        _ => ("held-after-foothold".into(), "foothold established but target still not reachable by the attacker".into()),
     }
 }
 
-/// Execute an unprotected-upgrade hijack (TP-01) in one fork: swap the target's
-/// code for the attacker payload under empty auth, then confirm control by
-/// calling the payload's marker `pwned()` and checking it returns 1337.
+/// Execute an unprotected-upgrade hijack (TP-01) in one fork.
 fn probe_upgrade(
     target_wasm: &[u8],
+    ctor: &[String],
     attacker_wasm: &[u8],
     upgrade_fn: &str,
     u_types: &[String],
 ) -> (String, String) {
     let env = Env::default();
     env.mock_all_auths();
-    let cid = env.register(target_wasm, ());
+    let cid = match try_deploy(&env, target_wasm, ctor) {
+        Some(c) => c,
+        None => return ("deploy-failed".into(), "could not deploy".into()),
+    };
     let attacker_hash = env.deployer().upload_contract_wasm(attacker_wasm);
 
     let mut args = SVec::new(&env);
@@ -217,7 +225,7 @@ fn probe_upgrade(
         args.push_back(v);
     }
 
-    env.set_auths(&[]); // the swap must land with NO signature
+    env.set_auths(&[]);
     let r = env.try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, upgrade_fn), args);
     if r.is_err() {
         return ("held".into(), "upgrade aborts under empty auth (gated)".into());
@@ -244,47 +252,41 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.first().map(|s| s.as_str()) == Some("--upgrade") {
-        // --upgrade <target_wasm> <attacker_wasm> <out_json> <upgrade_fn:types>
+        // --upgrade <target> <attacker> <out> <ctor_csv> <upgrade_fn:types>
         let target = std::fs::read(&args[1]).expect("read target wasm");
         let attacker = std::fs::read(&args[2]).expect("read attacker wasm");
         let out_path = &args[3];
-        let (uname, utypes) = split_spec(&args[4]);
-        let (verdict, detail) = probe_upgrade(&target, &attacker, &uname, &utypes);
-        std::fs::write(
-            out_path,
-            format!("{{\"verdict\":\"{}\",\"detail\":\"{}\"}}", verdict, esc(&detail)),
-        )
-        .expect("write out");
-        println!("[harness --upgrade] {} : {}", args[4], verdict);
+        let ctor = csv_types(&args[4]);
+        let (uname, utypes) = split_spec(&args[5]);
+        let (verdict, detail) = probe_upgrade(&target, &ctor, &attacker, &uname, &utypes);
+        std::fs::write(out_path, format!("{{\"verdict\":\"{}\",\"detail\":\"{}\"}}", verdict, esc(&detail))).expect("write out");
+        println!("[harness --upgrade] {} : {}", args[5], verdict);
         return;
     }
 
     if args.first().map(|s| s.as_str()) == Some("--chain") {
-        let wasm_path = &args[1];
+        // --chain <wasm> <out> <ctor_csv> <foothold:types> <target:types>
+        let wasm = std::fs::read(&args[1]).expect("read wasm");
         let out_path = &args[2];
-        let (fname, ftypes) = split_spec(&args[3]);
-        let (tname, ttypes) = split_spec(&args[4]);
-        let wasm = std::fs::read(wasm_path).expect("read wasm");
-        let (verdict, detail) = probe_chain(&wasm, &fname, &ftypes, &tname, &ttypes);
-        std::fs::write(
-            out_path,
-            format!("{{\"verdict\":\"{}\",\"detail\":\"{}\"}}", verdict, esc(&detail)),
-        )
-        .expect("write out");
-        println!("[harness --chain] {} -> {} : {}", args[3], args[4], verdict);
+        let ctor = csv_types(&args[3]);
+        let (fname, ftypes) = split_spec(&args[4]);
+        let (tname, ttypes) = split_spec(&args[5]);
+        let (verdict, detail) = probe_chain(&wasm, &ctor, &fname, &ftypes, &tname, &ttypes);
+        std::fs::write(out_path, format!("{{\"verdict\":\"{}\",\"detail\":\"{}\"}}", verdict, esc(&detail))).expect("write out");
+        println!("[harness --chain] {} -> {} : {}", args[4], args[5], verdict);
         return;
     }
 
-    // single-fn mode
-    let wasm_path = &args[0];
+    // single-fn mode: <wasm> <out> <ctor_csv> <fn:types>...
+    let wasm = std::fs::read(&args[0]).expect("read wasm");
     let out_path = &args[1];
-    let wasm = std::fs::read(wasm_path).expect("read wasm");
+    let ctor = csv_types(&args[2]);
 
     let mut records: Vec<String> = Vec::new();
-    for spec in &args[2..] {
+    for spec in &args[3..] {
         let (name, types) = split_spec(spec);
         let types_csv = spec.split_once(':').map(|(_, c)| c).unwrap_or("");
-        let (verdict, delta, detail) = probe(&wasm, &name, &types);
+        let (verdict, delta, detail) = probe(&wasm, &ctor, &name, &types);
         records.push(format!(
             "{{\"fn\":\"{}\",\"arg_types\":\"{}\",\"verdict\":\"{}\",\"events_delta\":{},\"detail\":\"{}\"}}",
             esc(&name), esc(types_csv), verdict, delta, esc(&detail)
