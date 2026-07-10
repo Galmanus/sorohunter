@@ -361,6 +361,52 @@ fn cmd_econ(id: &str, network: &str) -> i32 {
     0
 }
 
+/// Value-conservation probe: fork real state, and for each ordered pair of
+/// amount-taking fns, check whether a legitimate user can round-trip out richer
+/// than they went in — the broken-math / rounding class pattern-matching misses.
+fn cmd_roundtrip(id: &str, network: &str) -> i32 {
+    let url = rpc::rpc_url(network);
+    let seq = match rpc::latest_ledger(url) {
+        Some((s, _)) => s,
+        None => { eprintln!("getLatestLedger failed"); return 1; }
+    };
+    let entries = match rpc::fetch_snapshot_entries(url, id) {
+        Some(e) => e,
+        None => { eprintln!("could not fetch instance via RPC"); return 1; }
+    };
+    let wasm = match rpc::fetch_wasm(url, id) {
+        Some(w) => w,
+        None => { eprintln!("could not fetch wasm via RPC"); return 1; }
+    };
+    let plan = abi::plan_from_wasm(&wasm);
+    let li = soroban_sdk::testutils::LedgerInfo {
+        protocol_version: engine::host_protocol_version(),
+        sequence_number: seq,
+        timestamp: 0,
+        network_id: network_id(network),
+        base_reserve: 0,
+        min_persistent_entry_ttl: 1,
+        min_temp_entry_ttl: 1,
+        max_entry_ttl: 6_312_000,
+    };
+    let source = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+    let env = engine::forked_env(source, &li);
+    let tokens = econ::candidate_tokens(&env, id, entries[0].1 .0.as_ref(), &plan);
+    let n_ops = plan.iter().filter(|p| p.synthesizable && p.inputs.iter().any(|t| t == "i128" || t == "u128")).count();
+    eprintln!("candidate tokens: {:?}  amount-taking fns: {}", tokens, n_ops);
+    let source2 = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+    let rt = engine::probe_roundtrip(source2, &li, id, &tokens, &plan);
+    println!("\n=== value-conservation (round-trip) probe ({} amount fns, up to {} pairs) ===", n_ops, n_ops * n_ops);
+    if rt.is_empty() {
+        println!("  no roundtrip — no fn pair let a legitimate user end richer than their starting stake.");
+    } else {
+        for r in &rt {
+            println!("  [ROUNDTRIP]  {}  {}", r.fn_name, r.detail);
+        }
+    }
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
@@ -392,6 +438,20 @@ fn main() {
                 }
             }
             cmd_cve(&id, &network)
+        }
+        Some("roundtrip") if args.len() > 1 => {
+            let id = args[1].clone();
+            let mut network = "mainnet".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--network" && i + 1 < args.len() {
+                    network = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            cmd_roundtrip(&id, &network)
         }
         Some("probe") if args.len() > 1 => cmd_probe(&args[1..]),
         Some("scan") if args.len() > 1 => {

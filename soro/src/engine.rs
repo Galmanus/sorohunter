@@ -33,7 +33,7 @@ pub struct Verdict {
 }
 
 /// Verdicts that count as a real finding (mirrors report.FINDING_VERDICTS).
-pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed", "redirect", "replay", "oracle", "counterfeit"];
+pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed", "redirect", "replay", "oracle", "counterfeit", "roundtrip"];
 
 /// The protocol version this SDK's host runs at — stamp a state-fork snapshot
 /// with it so the host accepts it (mainnet's live protocol may be newer).
@@ -497,6 +497,86 @@ fn greed_check_in_env(env: &Env, contract: &str, tokens: &[String], p: &FnPlan) 
         }
     }
     None
+}
+
+const ROUNDTRIP_START: i128 = 1_000_000;
+
+/// Value-conservation (round-trip) check — the class that finds economic LOGIC bugs
+/// pattern-matching misses: broken math, rounding in the caller's favor, deposit/
+/// withdraw or swap/swap-back accounting mismatches. Not "is this a known attack
+/// shape" but "can a legitimate user, doing legitimate paired operations, end up
+/// richer than they started?" — the invariant every DeFi contract must hold.
+///
+/// The attacker is minted a fixed stake of each reserve token IN THE LOCAL FORK (a
+/// simulation; the issuer auth is mocked, mainnet is untouched), runs `f` then `g`,
+/// and if any reserve balance exceeds the starting stake with no offsetting loss,
+/// value was created from nothing — free money out of the contract's real reserves.
+fn roundtrip_check_in_env(env: &Env, contract: &str, tokens: &[String], f: &FnPlan, g: &FnPlan) -> Option<Verdict> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let attacker = Address::generate(env);
+    let attacker_str = addr_to_str(&attacker)?;
+    let caddr = Address::from_string(&SString::from_str(env, contract));
+    env.mock_all_auths();
+    // seed the attacker with a known stake of each reserve token (local fork mint)
+    for t in tokens {
+        let taddr = Address::from_string(&SString::from_str(env, t));
+        let mut a = SVec::new(env);
+        a.push_back(attacker.clone().into_val(env));
+        a.push_back(ROUNDTRIP_START.into_val(env));
+        let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&taddr, &Symbol::new(env, "mint"), a);
+    }
+    let before: Vec<Option<i128>> = tokens.iter().map(|t| token_balance(env, t, &attacker_str)).collect();
+    // run f then g as the attacker, moving a fraction of the stake
+    let amt = ROUNDTRIP_START / 2;
+    let fa = synth_oracle_args(env, &f.inputs, usize::MAX, &attacker, &attacker, amt)?;
+    let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &f.name), fa);
+    let ga = synth_oracle_args(env, &g.inputs, usize::MAX, &attacker, &attacker, amt)?;
+    let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &g.name), ga);
+    // net gain: some reserve token ended higher, and none ended lower (no offset)
+    let mut gained = 0i128;
+    let mut lost = false;
+    for (i, t) in tokens.iter().enumerate() {
+        if let (Some(b), Some(a)) = (before[i], token_balance(env, t, &attacker_str)) {
+            if a > b {
+                gained = gained.max(a - b);
+            } else if a < b {
+                lost = true;
+            }
+        }
+    }
+    if gained > 0 && !lost {
+        return Some(Verdict {
+            fn_name: format!("{}->{}", f.name, g.name),
+            arg_types: String::new(),
+            verdict: "roundtrip".into(),
+            events_delta: 0,
+            detail: format!(
+                "OBJ-ROUNDTRIP: a legitimate user running {}() then {}() ended {} of a reserve token RICHER than their starting stake, with no offsetting loss — the contract's value-conservation invariant is broken (rounding-in-favor / accounting mismatch / broken swap math), draining real reserves. CONFIRMED against forked state",
+                f.name, g.name, gained
+            ),
+        });
+    }
+    None
+}
+
+/// Value-conservation detector: for each ordered pair of mutating fns that take an
+/// amount, in a fresh forked env, run the round-trip check (see above).
+pub fn probe_roundtrip(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &str, tokens: &[String], plan: &[FnPlan]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    let ops: Vec<&FnPlan> = plan.iter()
+        .filter(|p| p.synthesizable && p.name != "__constructor" && p.inputs.iter().any(|t| t == "i128" || t == "u128"))
+        .collect();
+    for f in &ops {
+        for g in &ops {
+            let env = forked_env(source.clone(), li);
+            if let Some(v) = roundtrip_check_in_env(&env, contract, tokens, f, g) {
+                out.push(v);
+            }
+        }
+    }
+    out
 }
 
 /// Economic greed detector: the attacker-authorized counterpart to `probe_drain`.
@@ -1430,6 +1510,111 @@ mod replay_tests {
         let v = replay_check_in_env(&env, &contract, &p);
         assert!(v.is_some(), "must flag re-initialization via a temporary init-guard (admin takeover by TTL)");
         assert_eq!(v.unwrap().verdict, "replay");
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+
+    #[contracttype]
+    enum SKey {
+        Token,
+        Staked(Address),
+    }
+
+    // VULN: unstake pays back 101% of the stake — a legitimate stake->unstake
+    // round-trip mints 1% free value out of the vault's reserves. The broken-math
+    // class no pattern detector catches.
+    #[contract]
+    struct StakeVault;
+    #[contractimpl]
+    impl StakeVault {
+        pub fn __constructor(e: Env, token: Address) {
+            e.storage().instance().set(&SKey::Token, &token);
+        }
+        pub fn stake(e: Env, caller: Address, amount: i128) {
+            caller.require_auth();
+            let t: Address = e.storage().instance().get(&SKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&caller, &e.current_contract_address(), &amount);
+            let s: i128 = e.storage().persistent().get(&SKey::Staked(caller.clone())).unwrap_or(0);
+            e.storage().persistent().set(&SKey::Staked(caller), &(s + amount));
+        }
+        pub fn unstake(e: Env, caller: Address, amount: i128) {
+            caller.require_auth();
+            let s: i128 = e.storage().persistent().get(&SKey::Staked(caller.clone())).unwrap_or(0);
+            if amount > s {
+                panic!("over-unstake");
+            }
+            e.storage().persistent().set(&SKey::Staked(caller.clone()), &(s - amount));
+            let t: Address = e.storage().instance().get(&SKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &caller, &(amount * 101 / 100)); // BUG
+        }
+    }
+
+    // CORRECT: unstake pays exactly the stake; a round-trip nets zero.
+    #[contract]
+    struct SafeStakeVault;
+    #[contractimpl]
+    impl SafeStakeVault {
+        pub fn __constructor(e: Env, token: Address) {
+            e.storage().instance().set(&SKey::Token, &token);
+        }
+        pub fn stake(e: Env, caller: Address, amount: i128) {
+            caller.require_auth();
+            let t: Address = e.storage().instance().get(&SKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&caller, &e.current_contract_address(), &amount);
+            let s: i128 = e.storage().persistent().get(&SKey::Staked(caller.clone())).unwrap_or(0);
+            e.storage().persistent().set(&SKey::Staked(caller), &(s + amount));
+        }
+        pub fn unstake(e: Env, caller: Address, amount: i128) {
+            caller.require_auth();
+            let s: i128 = e.storage().persistent().get(&SKey::Staked(caller.clone())).unwrap_or(0);
+            if amount > s {
+                panic!("over-unstake");
+            }
+            e.storage().persistent().set(&SKey::Staked(caller.clone()), &(s - amount));
+            let t: Address = e.storage().instance().get(&SKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &caller, &amount);
+        }
+    }
+
+    fn make_token(env: &Env) -> Address {
+        env.register_stellar_asset_contract_v2(Address::generate(env)).address()
+    }
+    fn mint(env: &Env, t: &Address, to: &Address, amount: i128) {
+        token::StellarAssetClient::new(env, t).mint(to, &amount);
+    }
+    fn plan(name: &str) -> FnPlan {
+        FnPlan { name: name.into(), inputs: std::vec!["address".into(), "i128".into()], synthesizable: true, skip_reason: None }
+    }
+
+    #[test]
+    fn roundtrip_flags_broken_math() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token = make_token(&env);
+        let vault = env.register(StakeVault, (token.clone(),));
+        mint(&env, &token, &vault, 10_000_000); // reserves to pay the bonus
+        let tokens = std::vec![addr_to_str(&token).unwrap()];
+        let contract = addr_to_str(&vault).unwrap();
+        let v = roundtrip_check_in_env(&env, &contract, &tokens, &plan("stake"), &plan("unstake"));
+        assert!(v.is_some(), "must flag a stake->unstake that returns more than staked");
+        assert_eq!(v.unwrap().verdict, "roundtrip");
+    }
+
+    #[test]
+    fn roundtrip_silent_on_conserving_vault() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token = make_token(&env);
+        let vault = env.register(SafeStakeVault, (token.clone(),));
+        mint(&env, &token, &vault, 10_000_000);
+        let tokens = std::vec![addr_to_str(&token).unwrap()];
+        let contract = addr_to_str(&vault).unwrap();
+        let v = roundtrip_check_in_env(&env, &contract, &tokens, &plan("stake"), &plan("unstake"));
+        assert!(v.is_none(), "must NOT flag a value-conserving stake/unstake");
     }
 }
 
