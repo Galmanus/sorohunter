@@ -61,6 +61,31 @@ a local fork — never touching the deployed contract:
 The full loop — acquire real network bytecode → probe → executed finding —
 works end to end.
 
+## 4. Real production protocols, read-only — and the false positive it caught
+
+Pointed `scan` (read-only fetch + local fork) at **15 real third-party contracts
+I did not write** — 7 live **mainnet** (Blend pool / backstop / pool-factory,
+Comet BLND:USDC, Soroswap factory / router, Aquarius AMM) and 8 on **testnet**
+(Aquarius testnet router + recent public deploys). Result: **zero real findings.**
+A 30-function AMM (Comet) and a 20-function router probe entirely to held / view.
+Real, uncontrolled production code, no false alarms. (Read-only throughout:
+`scan` fetches the public WASM and probes a local fork; it never touches the
+deployed contract.)
+
+**The one thing that flagged — and why it made the tool better.** On the first
+pass, Soroswap's `initialize` came up as a missing-auth `BREACH`. It was a **false
+positive**, for a structural reason worth stating plainly: `scan` fresh-deploys
+the fetched WASM, and on a *fresh* deploy `initialize` has not run yet, so it
+succeeds — while on the live contract it is already initialized and guarded. I
+did **not** report a Soroswap bug. Instead the tool now runs a **re-init test**
+on any initializer-shaped breach: call it a second time under empty auth.
+Soroswap's `initialize` **reverts** on the second call (guarded), so it is
+reclassified `init-guarded` — a fresh-deploy artifact, not a finding. A contract
+whose initializer runs *twice* is a real re-initialization bug (TA-03), and is
+kept. This is the value of running on real contracts: it surfaced a systematic
+false-positive class and forced the fix that stops the tool from crying wolf —
+the exact failure mode that destroys a security tool's credibility.
+
 ## Honest caveats (what this does *not* claim)
 
 - **Not a found-in-the-wild 0-day.** The vulnerable cases are realistic bugs I *injected* into real contracts. The claim is "zero false positives on real correct code + catches realistic bugs," not "found a live exploit." A real disclosure would follow the coordinated path, not a README.

@@ -173,9 +173,9 @@ def cmd_scan(args) -> int:
     verdicts = probe_wasm(wasm, entries, os.path.join(scratch, "verdicts.json"))
     print(f"\n{args.contract_id}: {len(verdicts)} probes")
     for v in verdicts:
-        mark = {"breach": "BREACH", "chain": "CHAIN", "hijack": "HIJACK"}.get(v["verdict"], v["verdict"])
+        mark = rep.MARKS.get(v["verdict"], v["verdict"])
         print(f"  [{mark:<7}] {v['fn']}({v['arg_types']})  {v['detail']}")
-    findings = [v for v in verdicts if v["verdict"] in ("breach", "chain")]
+    findings = [v for v in verdicts if v["verdict"] in rep.FINDING_VERDICTS]
     if findings:
         print("\nNOTE: fresh-deploy probing. A finding here is a CANDIDATE — confirm against "
               "a state-fork before any disclosure. Never touch the live contract.")
@@ -197,14 +197,13 @@ def cmd_probe(args) -> int:
             print(f"skip (no spec): {label}")
             continue
         verdicts = probe_wasm(wasm, entries, os.path.join(REPORTS, f"_probe_{label}.json"))
-        findings = [v for v in verdicts if v["verdict"] in ("breach", "chain", "hijack")]
+        findings = [v for v in verdicts if v["verdict"] in rep.FINDING_VERDICTS]
         total_findings += len(findings)
         rows.append((label, len(verdicts), findings))
         if args.verbose or findings:
             print(f"\n{label}: {len(verdicts)} probes")
             for v in verdicts:
-                mark = {"breach": "BREACH", "chain": "CHAIN", "hijack": "HIJACK"}.get(
-                    v["verdict"], v["verdict"])
+                mark = rep.MARKS.get(v["verdict"], v["verdict"])
                 print(f"  [{mark:<7}] {v['fn']}({v['arg_types']})  {v['detail']}")
 
     print("\n=== summary ===")
