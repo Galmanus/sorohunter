@@ -86,6 +86,33 @@ kept. This is the value of running on real contracts: it surfaced a systematic
 false-positive class and forced the fix that stops the tool from crying wolf —
 the exact failure mode that destroys a security tool's credibility.
 
+## 5. Economic drain detection against real reserves (precision + recall)
+
+The `econ <id>` mode goes past auth: it measures **real value movement**. In a
+lazy fork (real on-chain state) it identifies the contract's tokens (via getters
++ instance storage), reads the contract's **real reserves**, probes each mutating
+function under empty auth, and flags any that **reduce the contract's real token
+balance** — an unauthenticated drain of real liquidity, confirmed against forked
+state.
+
+- **Precision — Comet (real BLND:USDC AMM, mainnet):** tokens found (BLND + USDC),
+  real reserves read (~7.4T USDC / ~707T BLND), 20 mutating functions probed →
+  **0 false drains**. A correctly-authed production AMM does not leak.
+- **Recall — a planted-vuln pool (`recall/drain_pool`, testnet):** a pool holding
+  50 XLM whose `steal()` transfers reserves out with no `require_auth`. The
+  detector read the real 500,000,000-stroop balance and flagged
+  `steal(address, i128)` → **[DRAIN]** "reduced the contract's real balance …
+  unauthenticated value extraction, CONFIRMED." (Pool `CC4DZ4JF…`, native XLM SAC.)
+
+Both sides on real contracts: silent on a real AMM, fires on a real drain. This
+is the class where the money-bugs live, measured — not asserted.
+
+*Scope, honestly:* this catches **unauthenticated** drains of real reserves. An
+**authorized-but-broken-accounting** economic bug (e.g. a swap that returns more
+than it takes, where the attacker *does* sign) needs attacker-authorized
+invariant-fuzzing over a sequence — the next layer, built on this same
+real-reserve measurement.
+
 ## Honest caveats (what this does *not* claim)
 
 - **Not a found-in-the-wild 0-day.** The vulnerable cases are realistic bugs I *injected* into real contracts. The claim is "zero false positives on real correct code + catches realistic bugs," not "found a live exploit." A real disclosure would follow the coordinated path, not a README.
