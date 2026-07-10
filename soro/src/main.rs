@@ -156,7 +156,14 @@ fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
             max_entry_ttl: 6_312_000,
         };
         let source = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
-        engine::probe_forked_lazy(source, &li, id, &plan)
+        let mut v = engine::probe_forked_lazy(source, &li, id, &plan);
+        // Role-capture pass: the event-delta breach probe flags "something changed"
+        // and misses silent admin setters entirely. probe_hijack reads the admin
+        // getter and confirms an attacker seizing control — a sharper, higher-severity
+        // finding on the same forked state.
+        let source_h = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+        v.extend(engine::probe_hijack(source_h, &li, id, &plan));
+        v
     } else {
         eprintln!("acquiring {} ({}) — read-only via RPC ...", id, network);
         let wasm = match rpc::fetch_wasm(url, id) {
