@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 mod abi;
+mod cve;
 mod econ;
 mod engine;
 mod fork;
@@ -195,6 +196,41 @@ fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
     0
 }
 
+/// Supply-chain scan: read the contract's soroban-sdk version from its WASM meta
+/// and cross-reference the confirmed CVE table. The check no logic scanner runs.
+fn cmd_cve(id: &str, network: &str) -> i32 {
+    let url = rpc::rpc_url(network);
+    let wasm = match rpc::fetch_wasm(url, id) {
+        Some(w) => w,
+        None => {
+            eprintln!("could not fetch wasm via RPC (SAC, archived instance, or bad id)");
+            return 1;
+        }
+    };
+    let sdkver = match cve::sdk_version_from_wasm(&wasm) {
+        Some(v) => v,
+        None => {
+            println!("{}: no rssdkver in contractmetav0 (SAC or meta stripped) — cannot fingerprint", id);
+            return 0;
+        }
+    };
+    let hits = cve::exposure(&sdkver);
+    println!("{}", id);
+    println!("  soroban-sdk: {}", sdkver);
+    if hits.is_empty() {
+        println!("  CVE exposure: none — SDK version is at or past every patched line.");
+        return 0;
+    }
+    println!("  CVE exposure ({} advisory/ies, by version — NECESSARY not sufficient):", hits.len());
+    for c in &hits {
+        println!("    [{}] {}", c.sev, c.id);
+        println!("        {}", c.what);
+        println!("        exploitable only if: {}", c.needs);
+    }
+    println!("\nNOTE: version-vulnerable flags EXPOSURE. Confirm the code pattern above (or run a\ndynamic probe) before disclosure. WASM read only — the live contract was never touched.");
+    0
+}
+
 /// Spike: identify a contract's tokens and read its REAL holdings in the fork —
 /// the value-measurement primitive the economic drain detector is built on.
 fn cmd_econ(id: &str, network: &str) -> i32 {
@@ -307,6 +343,20 @@ fn main() {
             }
             cmd_econ(&id, &network)
         }
+        Some("cve") if args.len() > 1 => {
+            let id = args[1].clone();
+            let mut network = "mainnet".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--network" && i + 1 < args.len() {
+                    network = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            cmd_cve(&id, &network)
+        }
         Some("probe") if args.len() > 1 => cmd_probe(&args[1..]),
         Some("scan") if args.len() > 1 => {
             let id = args[1].clone();
@@ -327,7 +377,7 @@ fn main() {
             cmd_scan(&id, &network, fork)
         }
         _ => {
-            eprintln!("usage: sorohunter <bench | probe <wasm...> | scan <id> [--network <net>] [--fork]>");
+            eprintln!("usage: sorohunter <bench | probe <wasm...> | scan <id> [--network <net>] [--fork] | econ <id> | cve <id> [--network <net>]>");
             2
         }
     };

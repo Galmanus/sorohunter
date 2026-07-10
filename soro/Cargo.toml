@@ -22,3 +22,7 @@ stellar-strkey = "0.0.13"
 # state-fork: build a minimal LedgerSnapshot (instance+code) from RPC entries and
 # probe against REAL on-chain state (Env::from_ledger_snapshot).
 soroban-ledger-snapshot = "25"
+# supply-chain scan: read `rssdkver` from the WASM contractmetav0 section and
+# cross-reference the confirmed soroban-sdk CVE table.
+wasmparser = "0.116"
+stellar-xdr = { version = "25", features = ["curr"] }
