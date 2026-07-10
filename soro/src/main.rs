@@ -164,6 +164,10 @@ fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
         // finding on the same forked state.
         let source_h = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
         v.extend(engine::probe_hijack(source_h, &li, id, &plan));
+        // Temporal pass: the clock is an attacker. Flag one-shot guards that live
+        // in temporary storage and evaporate past their TTL, reopening a replay.
+        let source_r = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+        v.extend(engine::probe_replay(source_r, &li, id, &plan));
         v
     } else {
         eprintln!("acquiring {} ({}) — read-only via RPC ...", id, network);
