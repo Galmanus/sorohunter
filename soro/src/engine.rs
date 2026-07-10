@@ -14,8 +14,8 @@ use std::rc::Rc;
 use soroban_ledger_snapshot::LedgerSnapshot;
 use soroban_sdk::{
     testutils::{
-        Address as _, Events as _, LedgerInfo, MockAuth, MockAuthInvoke, SnapshotSource,
-        SnapshotSourceInput,
+        Address as _, Events as _, Ledger as _, LedgerInfo, MockAuth, MockAuthInvoke,
+        SnapshotSource, SnapshotSourceInput,
     },
     Address, Bytes, Env, IntoVal, String as SString, Symbol, Val, Vec as SVec,
 };
@@ -33,7 +33,7 @@ pub struct Verdict {
 }
 
 /// Verdicts that count as a real finding (mirrors report.FINDING_VERDICTS).
-pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed", "redirect"];
+pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit", "drain", "greed", "redirect", "replay"];
 
 /// The protocol version this SDK's host runs at — stamp a state-fork snapshot
 /// with it so the host accepts it (mainnet's live protocol may be newer).
@@ -852,6 +852,149 @@ mod hijack_tests {
         let contract = addr_to_str(&vault).unwrap();
         let v = hijack_check_in_env(&env, &contract, &plan("set_admin"));
         assert!(v.is_none(), "hijack detector must NOT flag a current-admin-gated set_admin");
+    }
+}
+
+/// Archival-replay (temporal) attack — a class EVM-derived tooling cannot model,
+/// because EVM storage never expires. A one-shot guard (a "claimed"/"used"/nonce
+/// flag) stored in TEMPORARY storage evaporates when its TTL lapses, and the next
+/// `unwrap_or(default)` read reopens the one-time action. The attacker breaks
+/// nothing — they wait for the clock. It is the perfect AI-scale mistake: a model
+/// picks `temporary` because it is "cheaper", not grasping the security semantics.
+///
+/// The three-call time-travel probe, in an already-forked `env` (attacker
+/// pre-authorized via `mock_all_auths`):
+///   1. call succeeds (the one-time action happens),
+///   2. an immediate replay is BLOCKED (a one-shot guard exists),
+///   3. after the ledger advances past the temporary TTL the replay SUCCEEDS
+///      AGAIN — the guard lived in temporary storage and evaporated.
+/// A persistent-storage guard survives step 3, so it is never flagged.
+fn replay_check_in_env(env: &Env, contract: &str, p: &FnPlan) -> Option<Verdict> {
+    let caddr = Address::from_string(&SString::from_str(env, contract));
+    let sym = Symbol::new(env, &p.name);
+    let attacker = Address::generate(env);
+
+    // 1) first call must succeed for there to be a one-shot to replay
+    let a1 = build_args(env, &p.inputs, Some(&attacker))?;
+    env.mock_all_auths();
+    if env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &sym, a1).is_err() {
+        return None;
+    }
+    // 2) an immediate second call must be BLOCKED — i.e. a one-shot guard exists
+    let a2 = build_args(env, &p.inputs, Some(&attacker))?;
+    if env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &sym, a2).is_ok() {
+        return None; // repeatable fn, no one-shot guard — not this bug
+    }
+    // 3) advance the ledger far past the temporary TTL, then replay
+    let seq = env.ledger().sequence();
+    env.ledger().set_sequence_number(seq.saturating_add(1_000_000));
+    let a3 = build_args(env, &p.inputs, Some(&attacker))?;
+    if env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &sym, a3).is_ok() {
+        return Some(Verdict {
+            fn_name: p.name.clone(),
+            arg_types: p.inputs.join(","),
+            verdict: "replay".into(),
+            events_delta: 0,
+            detail: format!(
+                "OBJ-REPLAY: {}() blocks an immediate second call (one-shot guard) but SUCCEEDS AGAIN once the ledger advances past the temporary-storage TTL — the guard lives in temporary storage and evaporates, letting an attacker replay a one-time action (double-claim / nonce-reuse) by waiting. The clock is the attacker; CONFIRMED against forked state",
+                p.name
+            ),
+        });
+    }
+    None
+}
+
+/// Archival-replay detector: for each mutating fn, in a fresh forked env, run the
+/// three-call time-travel probe and flag one-shot guards that live in temporary
+/// storage (see `replay_check_in_env`).
+pub fn probe_replay(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &str, plan: &[FnPlan]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    for p in plan.iter().filter(|p| p.synthesizable && p.name != "__constructor") {
+        let env = forked_env(source.clone(), li);
+        if let Some(v) = replay_check_in_env(&env, contract, p) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Ledger as _, LedgerInfo};
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    #[contracttype]
+    enum RKey {
+        Claimed(Address),
+    }
+
+    // VULN: the "already claimed" guard lives in TEMPORARY storage. After its TTL
+    // lapses the flag evaporates and the caller can claim a second time.
+    #[contract]
+    struct TempGuardVault;
+    #[contractimpl]
+    impl TempGuardVault {
+        pub fn claim(e: Env, caller: Address) {
+            caller.require_auth();
+            if e.storage().temporary().has(&RKey::Claimed(caller.clone())) {
+                panic!("already claimed");
+            }
+            e.storage().temporary().set(&RKey::Claimed(caller), &true);
+        }
+    }
+
+    // CORRECT: the same guard in PERSISTENT storage survives archival, so a replay
+    // stays blocked no matter how much time passes.
+    #[contract]
+    struct PersistentGuardVault;
+    #[contractimpl]
+    impl PersistentGuardVault {
+        pub fn claim(e: Env, caller: Address) {
+            caller.require_auth();
+            if e.storage().persistent().has(&RKey::Claimed(caller.clone())) {
+                panic!("already claimed");
+            }
+            e.storage().persistent().set(&RKey::Claimed(caller), &true);
+        }
+    }
+
+    fn plan() -> FnPlan {
+        FnPlan { name: "claim".into(), inputs: std::vec!["address".into()], synthesizable: true, skip_reason: None }
+    }
+
+    fn stamp(env: &Env) {
+        env.ledger().set(LedgerInfo {
+            protocol_version: host_protocol_version(),
+            sequence_number: 100,
+            timestamp: 0,
+            network_id: [0; 32],
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6_312_000,
+        });
+    }
+
+    #[test]
+    fn replay_flags_temporary_guard() {
+        let env = Env::default();
+        stamp(&env);
+        let vault = env.register(TempGuardVault, ());
+        let contract = addr_to_str(&vault).unwrap();
+        let v = replay_check_in_env(&env, &contract, &plan());
+        assert!(v.is_some(), "must flag a one-shot guard that lives in temporary storage");
+        assert_eq!(v.unwrap().verdict, "replay");
+    }
+
+    #[test]
+    fn replay_silent_on_persistent_guard() {
+        let env = Env::default();
+        stamp(&env);
+        let vault = env.register(PersistentGuardVault, ());
+        let contract = addr_to_str(&vault).unwrap();
+        let v = replay_check_in_env(&env, &contract, &plan());
+        assert!(v.is_none(), "must NOT flag a guard that lives in persistent storage");
     }
 }
 
