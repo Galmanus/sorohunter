@@ -88,6 +88,79 @@ pub fn parse_spec(entries: &[Value]) -> Vec<FnPlan> {
     plan
 }
 
+// ---- native spec-from-wasm (no stellar-CLI shell-out) ----
+
+use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef};
+
+/// Canonical type label from an XDR `ScSpecTypeDef` — the native mirror of
+/// `type_name` (which works on the CLI's JSON).
+pub fn typedef_name(t: &ScSpecTypeDef) -> String {
+    use ScSpecTypeDef as T;
+    match t {
+        T::Address => "address".into(),
+        T::MuxedAddress => "muxed_address".into(),
+        T::Bool => "bool".into(),
+        T::Void => "void".into(),
+        T::U32 => "u32".into(),
+        T::I32 => "i32".into(),
+        T::U64 => "u64".into(),
+        T::I64 => "i64".into(),
+        T::U128 => "u128".into(),
+        T::I128 => "i128".into(),
+        T::U256 => "u256".into(),
+        T::I256 => "i256".into(),
+        T::Bytes => "bytes".into(),
+        T::String => "string".into(),
+        T::Symbol => "symbol".into(),
+        T::BytesN(b) => format!("bytes_n:{}", b.n),
+        T::Udt(u) => format!("udt:{}", u.name.to_string()),
+        T::Vec(v) => format!("vec<{}>", typedef_name(&v.element_type)),
+        T::Option(o) => format!("option<{}>", typedef_name(&o.value_type)),
+        T::Map(_) => "map".into(),
+        T::Tuple(_) => "tuple".into(),
+        T::Result(_) => "result".into(),
+        _ => "unknown".into(),
+    }
+}
+
+fn typedef_synthesizable(t: &ScSpecTypeDef) -> bool {
+    use ScSpecTypeDef as T;
+    matches!(
+        t,
+        T::Address | T::Bool | T::Void | T::U32 | T::I32 | T::U64 | T::I64 | T::U128 | T::I128 | T::Bytes | T::String | T::Symbol
+    ) || matches!(t, T::BytesN(_))
+}
+
+/// Parse the contract spec directly from the WASM custom section into a probe
+/// plan — the native replacement for `stellar contract info interface`.
+pub fn plan_from_wasm(wasm: &[u8]) -> Vec<FnPlan> {
+    let entries = match soroban_spec::read::from_wasm(wasm) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut plan = Vec::new();
+    for e in entries {
+        if let ScSpecEntry::FunctionV0(f) = e {
+            let name = f.name.to_string();
+            let inputs: Vec<String> = f.inputs.iter().map(|i| typedef_name(&i.type_)).collect();
+            let unsynth: Vec<String> =
+                f.inputs.iter().filter(|i| !typedef_synthesizable(&i.type_)).map(|i| typedef_name(&i.type_)).collect();
+            let synthesizable = unsynth.is_empty();
+            plan.push(FnPlan {
+                name,
+                inputs,
+                synthesizable,
+                skip_reason: if synthesizable {
+                    None
+                } else {
+                    Some(format!("unsynthesizable args: {}", unsynth.join(", ")))
+                },
+            });
+        }
+    }
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

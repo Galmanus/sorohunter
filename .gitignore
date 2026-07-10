@@ -5,3 +5,4 @@ target/
 verdicts*.json
 .pytest_cache/
 reports/_*
+soro/RESEARCH_DOSSIER.md
