@@ -27,6 +27,7 @@ use serde_json::Value;
 /// self-contained.
 const ATTACKER: &[u8] = include_bytes!("../assets/attacker_pwn.wasm");
 const LIAR_ORACLE: &[u8] = include_bytes!("../assets/liar_oracle.wasm");
+const LIAR_TOKEN: &[u8] = include_bytes!("../assets/liar_token.wasm");
 
 fn probe_wasm_file(path: &str) -> Vec<engine::Verdict> {
     let wasm = std::fs::read(path).unwrap_or_default();
@@ -340,6 +341,21 @@ fn cmd_econ(id: &str, network: &str) -> i32 {
     } else {
         for o in &oracle {
             println!("  [ORACLE]  {}({})  {}", o.fn_name, o.arg_types, o.detail);
+        }
+    }
+
+    // Token-balance-lie: the contract accepts a caller-supplied token without an
+    // allowlist. Differential — a planted counterfeit (transfer moves nothing,
+    // balance lies) vs a plain address; more real reserve out under the counterfeit
+    // is a confirmed fake-deposit / balance-inflation.
+    let source6 = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+    let counterfeit = engine::probe_token_lie(source6, &li, id, &tokens, &plan, LIAR_TOKEN);
+    println!("\n=== token-balance-lie probe ({} address-taking fns, planted counterfeit token) ===", n_multi);
+    if counterfeit.is_empty() {
+        println!("  no counterfeit — no fn released real reserve for a caller-supplied fake token.");
+    } else {
+        for c in &counterfeit {
+            println!("  [COUNTERFEIT]  {}({})  {}", c.fn_name, c.arg_types, c.detail);
         }
     }
     0
