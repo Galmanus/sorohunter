@@ -10,6 +10,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use soroban_ledger_snapshot::LedgerSnapshot;
 use soroban_sdk::{
     testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
     Address, Bytes, Env, IntoVal, String as SString, Symbol, Val, Vec as SVec,
@@ -28,6 +29,12 @@ pub struct Verdict {
 
 /// Verdicts that count as a real finding (mirrors report.FINDING_VERDICTS).
 pub const FINDING_VERDICTS: &[&str] = &["breach", "chain", "hijack", "reinit"];
+
+/// The protocol version this SDK's host runs at — stamp a state-fork snapshot
+/// with it so the host accepts it (mainnet's live protocol may be newer).
+pub fn host_protocol_version() -> u32 {
+    Env::default().ledger().protocol_version()
+}
 
 fn synth(env: &Env, t: &str, attacker: Option<&Address>) -> Option<Val> {
     if t == "address" {
@@ -230,4 +237,57 @@ pub fn probe_contract(wasm: &[u8], attacker_wasm: &[u8], plan: &[FnPlan]) -> Vec
     }
 
     out
+}
+
+/// Probe a contract against its REAL forked on-chain state (a minimal
+/// LedgerSnapshot: instance storage + code). The contract already exists at its
+/// real address with real admin/config, so a breach here is CONFIRMED — not a
+/// fresh-deploy candidate — and one-time initializers revert naturally (no
+/// heuristic). Single-fn for v1; chains/upgrades stay in fresh-deploy mode.
+pub fn probe_forked(snapshot: &LedgerSnapshot, contract_id: &str, plan: &[FnPlan]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    for p in plan.iter().filter(|p| p.name != "__constructor") {
+        if !p.synthesizable {
+            out.push(Verdict {
+                fn_name: p.name.clone(),
+                arg_types: p.inputs.join(","),
+                verdict: "skipped".into(),
+                events_delta: 0,
+                detail: p.skip_reason.clone().unwrap_or_default(),
+            });
+            continue;
+        }
+        let (v, d, det) = probe_one_forked(snapshot, contract_id, &p.name, &p.inputs);
+        out.push(Verdict {
+            fn_name: p.name.clone(),
+            arg_types: p.inputs.join(","),
+            verdict: v,
+            events_delta: d,
+            detail: det,
+        });
+    }
+    out
+}
+
+fn probe_one_forked(snapshot: &LedgerSnapshot, contract_id: &str, name: &str, types: &[String]) -> (String, i64, String) {
+    let env = Env::from_ledger_snapshot(snapshot.clone());
+    let addr = Address::from_string(&SString::from_str(&env, contract_id));
+    let args = match build_args(&env, types, None) {
+        Some(a) => a,
+        None => return ("skipped".into(), 0, "unsynthesizable arg".into()),
+    };
+    env.set_auths(&[]);
+    let before = env.events().all().events().len() as i64;
+    let res = env.try_invoke_contract::<Val, soroban_sdk::Error>(&addr, &Symbol::new(&env, name), args);
+    let after = env.events().all().events().len() as i64;
+    let delta = after - before;
+    match res {
+        Err(_) => ("held".into(), delta, "aborted under empty auth (real forked state)".into()),
+        Ok(_) if delta > 0 => (
+            "breach".into(),
+            delta,
+            "CONFIRMED against real forked state: state change + event under empty auth — missing auth".into(),
+        ),
+        Ok(_) => ("view".into(), delta, "succeeded, no event — read-only".into()),
+    }
 }

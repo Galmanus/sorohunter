@@ -19,3 +19,6 @@ soroban-spec = "25"
 # native RPC fetch: getLedgerEntries over JSON-RPC, no `stellar contract fetch`.
 ureq = { version = "2", features = ["json"] }
 stellar-strkey = "0.0.13"
+# state-fork: build a minimal LedgerSnapshot (instance+code) from RPC entries and
+# probe against REAL on-chain state (Env::from_ledger_snapshot).
+soroban-ledger-snapshot = "25"

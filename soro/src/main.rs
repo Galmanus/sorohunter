@@ -105,33 +105,89 @@ fn cmd_probe(wasms: &[String]) -> i32 {
 
 /// Acquire a public contract read-only (fetch WASM + spec via the stellar CLI)
 /// and probe a local fork. Never touches the deployed contract.
-fn cmd_scan(id: &str, network: &str) -> i32 {
-    eprintln!("acquiring {} ({}) — read-only via RPC ...", id, network);
-    // native: fetch the WASM over Soroban RPC (getLedgerEntries), no stellar CLI.
-    let wasm = match rpc::fetch_wasm(rpc::rpc_url(network), id) {
-        Some(w) => w,
-        None => {
-            eprintln!("could not fetch wasm via RPC (bad id, not found, or RPC error)");
+/// Network passphrase hash (sha256) — mainnet / testnet, hardcoded constants.
+fn network_id(network: &str) -> [u8; 32] {
+    match network {
+        "mainnet" | "public" => [
+            0x7a, 0xc3, 0x39, 0x97, 0x54, 0x4e, 0x31, 0x75, 0xd2, 0x66, 0xbd, 0x02, 0x24, 0x39,
+            0xb2, 0x2c, 0xdb, 0x16, 0x50, 0x8c, 0x01, 0x16, 0x3f, 0x26, 0xe5, 0xcb, 0x2a, 0x3e,
+            0x10, 0x45, 0xa9, 0x79,
+        ],
+        _ => [
+            0xce, 0xe0, 0x30, 0x2d, 0x59, 0x84, 0x4d, 0x32, 0xbd, 0xca, 0x91, 0x5c, 0x82, 0x03,
+            0xdd, 0x44, 0xb3, 0x3f, 0xbb, 0x7e, 0xdc, 0x19, 0x05, 0x1e, 0xa3, 0x7a, 0xbe, 0xdf,
+            0x28, 0xec, 0xd4, 0x72,
+        ],
+    }
+}
+
+fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
+    let url = rpc::rpc_url(network);
+    let verdicts = if fork {
+        eprintln!("acquiring {} ({}) — STATE-FORK via RPC (real on-chain state) ...", id, network);
+        let (seq, proto) = match rpc::latest_ledger(url) {
+            Some(x) => x,
+            None => {
+                eprintln!("getLatestLedger failed");
+                return 1;
+            }
+        };
+        let entries = match rpc::fetch_snapshot_entries(url, id) {
+            Some(e) => e,
+            None => {
+                eprintln!("could not fetch contract state via RPC");
+                return 1;
+            }
+        };
+        let wasm = match rpc::fetch_wasm(url, id) {
+            Some(w) => w,
+            None => {
+                eprintln!("could not fetch wasm via RPC");
+                return 1;
+            }
+        };
+        let plan = abi::plan_from_wasm(&wasm);
+        let _ = proto; // mainnet's live protocol (e.g. 27) may exceed the host's
+        let snapshot = soroban_ledger_snapshot::LedgerSnapshot {
+            // stamp with the host's own protocol so it accepts the snapshot.
+            protocol_version: engine::host_protocol_version(),
+            sequence_number: seq,
+            timestamp: 0,
+            network_id: network_id(network),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 1,
+            min_temp_entry_ttl: 1,
+            max_entry_ttl: 6_312_000,
+            ledger_entries: entries,
+        };
+        engine::probe_forked(&snapshot, id, &plan)
+    } else {
+        eprintln!("acquiring {} ({}) — read-only via RPC ...", id, network);
+        let wasm = match rpc::fetch_wasm(url, id) {
+            Some(w) => w,
+            None => {
+                eprintln!("could not fetch wasm via RPC (bad id, not found, or RPC error)");
+                return 1;
+            }
+        };
+        let plan = abi::plan_from_wasm(&wasm);
+        if plan.is_empty() {
+            eprintln!("no contract spec found in fetched wasm");
             return 1;
         }
+        engine::probe_contract(&wasm, ATTACKER, &plan)
     };
-    // native: ABI straight from the fetched WASM's custom section.
-    let plan = abi::plan_from_wasm(&wasm);
-    if plan.is_empty() {
-        eprintln!("no contract spec found in fetched wasm");
-        return 1;
-    }
-    let verdicts = engine::probe_contract(&wasm, ATTACKER, &plan);
 
-    println!("\n{}: {} probes", id, verdicts.len());
+    println!("\n{}: {} probes{}", id, verdicts.len(), if fork { " (state-fork)" } else { "" });
     for v in &verdicts {
         println!("  [{:<7}] {}({})  {}", report::mark(&v.verdict), v.fn_name, v.arg_types, v.detail);
     }
     if !report::findings(&verdicts).is_empty() {
-        println!(
-            "\nNOTE: fresh-deploy probing. A finding here is a CANDIDATE — confirm against \
-             a state-fork before any disclosure. Never touch the live contract."
-        );
+        if fork {
+            println!("\nNOTE: probed against real forked state — findings are CONFIRMED, not fresh-deploy candidates. Disclose responsibly; the fork is local, the live contract was never touched.");
+        } else {
+            println!("\nNOTE: fresh-deploy probing. A finding here is a CANDIDATE — re-run with --fork (real state) before any disclosure. Never touch the live contract.");
+        }
     }
     0
 }
@@ -144,19 +200,23 @@ fn main() {
         Some("scan") if args.len() > 1 => {
             let id = args[1].clone();
             let mut network = "testnet".to_string();
+            let mut fork = false;
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--network" && i + 1 < args.len() {
                     network = args[i + 1].clone();
                     i += 2;
+                } else if args[i] == "--fork" {
+                    fork = true;
+                    i += 1;
                 } else {
                     i += 1;
                 }
             }
-            cmd_scan(&id, &network)
+            cmd_scan(&id, &network, fork)
         }
         _ => {
-            eprintln!("usage: sorohunter <bench | probe <wasm...> | scan <id> [--network <net>]>");
+            eprintln!("usage: sorohunter <bench | probe <wasm...> | scan <id> [--network <net>] [--fork]>");
             2
         }
     };
