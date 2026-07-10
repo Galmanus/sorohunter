@@ -896,7 +896,7 @@ fn replay_check_in_env(env: &Env, contract: &str, p: &FnPlan) -> Option<Verdict>
             verdict: "replay".into(),
             events_delta: 0,
             detail: format!(
-                "OBJ-REPLAY: {}() blocks an immediate second call (one-shot guard) but SUCCEEDS AGAIN once the ledger advances past the temporary-storage TTL — the guard lives in temporary storage and evaporates, letting an attacker replay a one-time action (double-claim / nonce-reuse) by waiting. The clock is the attacker; CONFIRMED against forked state",
+                "OBJ-REPLAY (TS-01 invariant-decay): {}() blocks an immediate second call (a one-shot guard exists) but SUCCEEDS AGAIN after the ledger advances ~1M sequences past the guard's TTL without the guard being renewed — it lives in TEMPORARY storage, which is deleted silently (next read returns None), so the attacker just waits: double-claim, nonce-reuse, or re-initialization. Bypass severity is specific to temporary storage (a persistent guard survives and is not flagged). A contract that extend_ttl's the guard within that window is not reachable this way. CONFIRMED against forked state",
                 p.name
             ),
         });
@@ -995,6 +995,40 @@ mod replay_tests {
         let contract = addr_to_str(&vault).unwrap();
         let v = replay_check_in_env(&env, &contract, &plan());
         assert!(v.is_none(), "must NOT flag a guard that lives in persistent storage");
+    }
+
+    #[contracttype]
+    enum IKey {
+        Initialized,
+        Admin,
+    }
+
+    // The severe instance: the INIT guard lives in temporary storage. After its TTL
+    // lapses, `initialize` runs again and the attacker re-sets the admin — takeover
+    // by clock, against a contract whose init-guard a static scanner marks "green".
+    #[contract]
+    struct ReinitVault;
+    #[contractimpl]
+    impl ReinitVault {
+        pub fn initialize(e: Env, admin: Address) {
+            if e.storage().temporary().has(&IKey::Initialized) {
+                panic!("already initialized");
+            }
+            e.storage().temporary().set(&IKey::Initialized, &true);
+            e.storage().instance().set(&IKey::Admin, &admin);
+        }
+    }
+
+    #[test]
+    fn replay_flags_temporary_init_guard_reinit() {
+        let env = Env::default();
+        stamp(&env);
+        let vault = env.register(ReinitVault, ());
+        let contract = addr_to_str(&vault).unwrap();
+        let p = FnPlan { name: "initialize".into(), inputs: std::vec!["address".into()], synthesizable: true, skip_reason: None };
+        let v = replay_check_in_env(&env, &contract, &p);
+        assert!(v.is_some(), "must flag re-initialization via a temporary init-guard (admin takeover by TTL)");
+        assert_eq!(v.unwrap().verdict, "replay");
     }
 }
 
