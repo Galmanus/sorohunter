@@ -1,1 +1,1 @@
-{ "vuln_vault": ["withdraw"], "safe_vault": [] }
+{ "vuln_vault": ["withdraw"], "safe_vault": [], "chain_vault": ["set_admin->withdraw"], "safe_chain_vault": [] }

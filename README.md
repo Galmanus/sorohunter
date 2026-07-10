@@ -1,84 +1,88 @@
 # sorohunter
 
-**An adversarial hunter for agentic Soroban contracts.** It points generic,
-ABI-driven probes at the agentic-payments contract class on Stellar (mandates,
-escrow, settlement, constitutional contracts) via local fork-simulation, and
-reports missing-authorization bugs with an executed PoC. The surface no one
-audits, done the one way that stays legal.
+**The fork-validated detector layer for the [Soroban ATT&CK](SOROBAN_ATTACK.md).**
+It points generic, ABI-driven probes at the agentic-payments contract class on
+Stellar (mandates, escrow, settlement, constitutional contracts) in a **local
+fork**, executes adversary techniques step by step, and reports each finding
+with the invocation sequence that produced it as an **executed PoC**. The
+surface no one audits, done the one way that stays legal.
 
-See [`SPEC.md`](SPEC.md) for the full design.
+- **Taxonomy:** [`SOROBAN_ATTACK.md`](SOROBAN_ATTACK.md) — tactics × techniques, shipped-vs-roadmap per cell.
+- **Design:** [`SPEC.md`](SPEC.md). **A kill chain as a path through the matrix:** [`KILLCHAIN.md`](KILLCHAIN.md).
 
-## The idea in one breath
+## What "fork-validated" means (and why it matters)
 
-A missing `require_auth` on a Soroban contract means anyone can drain it. It is
-the number-one bug and it is ABI-drivable: for every function a contract
-exports, synthesize args from its published types, invoke it **under empty
-authorization** in a local fork, and watch. A call that changes state (emits an
-event) with no signature is a finding, and the invocation itself is the PoC. A
-call that aborts held the line. A call that returns without changing anything is
-a read-only view, not a finding.
+A finding is a **run**, not a guess. Every technique executes in a local
+`soroban-sdk` `Env` against the target's public WASM; a call that drains or
+seizes the forked contract is a finding, a call that holds the line is not.
+There is no inference step, so there is no inference false-positive — the class
+of error that caps AI scanners at a 20-40% false-positive tax. Recon is
+read-only acquisition; **no transaction is ever signed or sent to a live
+network.** That is the line between a tool and a crime, and it is a code
+invariant in the harness.
 
-The tool only ever reads a contract's **public** ABI and WASM and runs it in a
-**local** `Env`. It never sends a transaction to any network. That is the line
-between a tool and a crime, and it is a code invariant here.
+## Shipped techniques (2 of the matrix)
 
-## Run
+- **TA-01 — missing `require_auth`.** A state mutation succeeds under empty auth. The invocation is the PoC. *(EVM analog: SWC-105 / OWASP-SC access control — the #1 Soroban footgun.)*
+- **TE-01 — composition chain (admin capture → drain).** The differentiator: some vaults are **clean to any single-function probe** yet fall to a two-step chain. sorohunter proposes candidate chains (address-setter × gated action) and confirms each **by executing it in one fork** — foothold under empty auth, then the gated action as the seized principal.
+
+The rest of the [matrix](SOROBAN_ATTACK.md) (TA-02..05, TP, TD, TS, and the
+cryptographic/ZK tactic) is roadmap or manual, marked honestly there.
+
+## What the benchmark measures — and what it does not
 
 ```bash
-# 1. build the benchmark corpus (once)
-cd bench && stellar contract build && cd ..
-
-# 2. prove precision on the corpus (planted vuln + clean decoy)
+cd bench && stellar contract build && cd ..   # build the corpus (once)
 python3 sorohunter/cli.py bench
-#   precision 100% · recall 100% (tp 1, fp 0, fn 0)
-#     vuln_vault     findings: withdraw
-#     safe_vault     findings: clean
-
-# 3. point it at a real public contract (read-only acquire + local fork)
-python3 sorohunter/cli.py scan <CONTRACT_ID> --network testnet
+#   precision 100% · recall 100% (tp 2, fp 0, fn 0)
+#     vuln_vault        withdraw             (TA-01)
+#     safe_vault        clean
+#     chain_vault       set_admin->withdraw  (TE-01 composition)
+#     safe_chain_vault  clean                (foothold gated — the FP control held)
 ```
 
-## Why benchmark first
-
-Pointing an imprecise hunter at live protocols burns the exact reputation this
-is meant to build. So v1 proves precision/recall on a corpus we control — a
-contract with a planted missing-auth `withdraw` and a correctly-authed decoy —
-before it earns the right to flag anything real. This is the T3MP3ST discipline:
-no executed PoC, no finding; measured against ground truth.
-
-## Tests
+**Read this honestly.** These figures are **precision-first, measured against a
+controlled ground-truth corpus** of 4 contracts: two planted vulns (a missing-
+auth drain, a composition chain) and two clean decoys (one of which is a
+composition false-positive control). They say: *the two shipped detectors catch
+their planted bugs and raise zero false alarms on the decoys, including on a
+contract that looks vulnerable but is not.* They are **not** a general-auditor
+detection rate, and are not comparable to broad benchmarks (e.g. EVMBench's
+~47% autonomous ceiling): this measures two specific, scoped techniques against
+ground truth we control. Precision on the decoys is the load-bearing property —
+a false positive on a live protocol would burn the exact credibility this is
+built to earn. The corpus grows with each shipped technique.
 
 ```bash
-python3 -m pytest -q          # ABI parser + evaluation logic
+python3 -m pytest -q                          # ABI parser + evaluation logic (14 tests)
+python3 sorohunter/cli.py scan <CONTRACT_ID> --network testnet   # read-only acquire + local fork
 ```
 
 ## Design
 
-- **ABI (`sorohunter/abi.py`)** — parses `stellar contract info interface
-  --output json` into a probe plan; flags non-synthesizable args (custom
-  structs, collections) instead of probing with a bogus value.
-- **Harness (`harness/`, Rust)** — the generic prober. Loads a WASM, synthesizes
-  `Val`s from the ABI types, invokes each function by symbol under empty auth,
-  and classifies via an event-diff (held / breach / view). This is what makes
-  one harness work on any contract.
-- **Report (`sorohunter/report.py`)** — scores verdicts against ground truth
-  (precision/recall) and renders md+json.
+- **ABI (`sorohunter/abi.py`)** — parses `stellar contract info interface --output json` into a probe plan; flags non-synthesizable args instead of probing with a bogus value.
+- **Harness (`harness/`, Rust)** — the generic prober. Single-fn mode invokes each function under empty auth and classifies by event-diff (held / breach / view). `--chain` mode executes a two-step privilege chain in one fork and confirms composition by execution. One harness, any contract.
+- **Chain proposer (`cli.py:probe_chains`)** — proposes candidate chains (heuristic: address-setter foothold × held gate) and lets the harness **confirm by execution**; only a drained fork becomes a finding, so the heuristic cannot raise a false positive.
+- **Report (`sorohunter/report.py`)** — scores verdicts against ground truth (precision/recall) and renders md+json.
 
-## Honest limits (v1)
+## Honest limits
 
-- `scan` fresh-deploys the fetched WASM, so a breach on a real contract is a
-  **candidate** — confirm against a state-fork (`stellar snapshot`) before any
-  disclosure. Never touch the live contract.
-- The event-diff misses a mutation that emits no event, and an erroring view is
-  classed `held` rather than `view` (harmless: not a false positive). Both are
-  refinements, not blockers.
-- One probe class (missing-auth). Overflow, unprotected-upgrade, storage/TTL,
-  state-machine, and cross-contract are roadmap.
+- **2 techniques shipped** (TA-01, TE-01). The rest of the Soroban ATT&CK is roadmap (mechanical) or manual (the cryptographic/ZK tactic — that is verifier/circuit review, not fork-sim). Status is marked per cell in [`SOROBAN_ATTACK.md`](SOROBAN_ATTACK.md).
+- `scan` fresh-deploys the fetched WASM, so a finding on a real contract is a **candidate** — confirm against a state-fork (`stellar snapshot`) before any disclosure. Never touch the live contract.
+- The event-diff misses a mutation that emits no event (this is *why* the composition detector checks the downstream gated action, not just events); an erroring view is classed `held`, not `view` (harmless — not a false positive).
+- The chain proposer is heuristic in *what it tries*; it is exact in *what it confirms* (execution). Coverage of chains it does not propose is a roadmap item.
 
 ## Roadmap
 
-- **Proof-carrying finding ledger:** anchor each confirmed finding on-chain
-  (hash of PoC + target + timestamp + signature) — an immutable, timestamped,
-  verifiable "found-first" record. The reputation engine.
-- State-fork execution for real targets; more probe classes; an LLM
-  source-reader for business-logic probes; wrap Scout/OZ as a static layer.
+Sequenced by the [matrix](SOROBAN_ATTACK.md): more Access techniques (TA-02
+unprotected admin setter, TA-03 initializer re-entry), Persistence (TP-01
+unprotected upgrade), Storage/TTL (TS-01), then state-fork execution for real
+targets, and the **proof-carrying finding ledger** — anchor each confirmed
+finding on-chain (hash of PoC + technique-ID + target + timestamp + signature)
+as an immutable, timestamped, verifiable "found-first" record. The reputation
+engine.
+
+## Attribution & posture
+
+Defensive security research: find bugs in a sandbox, disclose them responsibly,
+never touch live funds. The legal perimeter is enforced in code, not promised.

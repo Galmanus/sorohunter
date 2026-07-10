@@ -59,7 +59,41 @@ def probe_wasm(wasm_path: str, entries: list[dict], out_json: str) -> list[dict]
         if not p["synthesizable"]:
             verdicts.append({"fn": p["name"], "arg_types": ",".join(p["inputs"]),
                              "verdict": "skipped", "events_delta": 0, "detail": p["skip_reason"]})
+    verdicts += probe_chains(wasm_path, plan, verdicts, out_json)
     return verdicts
+
+
+def probe_chains(wasm_path: str, plan: list[dict], verdicts: list[dict],
+                 out_json: str) -> list[dict]:
+    """Propose and fork-validate two-step privilege chains (TE-01 / SK-C01).
+
+    Candidate footholds are synthesizable functions that take an address (a
+    setter the attacker can point at itself); candidate targets are functions
+    that HELD under empty auth (a gated action). For each pair the harness runs
+    the chain in one fork, and only a confirmed `chain` verdict — the gated
+    action actually executed for the attacker after the foothold — becomes a
+    finding. The proposer is heuristic; the confirmation is by execution, so the
+    heuristic cannot raise a false positive.
+    """
+    inputs_by_name = {p["name"]: p["inputs"] for p in plan}
+    footholds = [p for p in plan if p["synthesizable"] and "address" in p["inputs"]]
+    held = [v["fn"] for v in verdicts if v.get("verdict") == "held"]
+    chain_out = out_json + ".chain"
+    found: list[dict] = []
+    for fh in footholds:
+        for tgt in held:
+            if fh["name"] == tgt:
+                continue
+            f_spec = f"{fh['name']}:{','.join(fh['inputs'])}"
+            t_spec = f"{tgt}:{','.join(inputs_by_name.get(tgt, []))}"
+            subprocess.run([harness_bin(), "--chain", wasm_path, chain_out, f_spec, t_spec],
+                           check=True, capture_output=True, text=True)
+            res = json.load(open(chain_out))
+            if res.get("verdict") == "chain":
+                found.append({"fn": f"{fh['name']}->{tgt}", "arg_types": "",
+                              "verdict": "chain", "events_delta": 0,
+                              "detail": res.get("detail", "")})
+    return found
 
 
 def cmd_bench(args) -> int:
@@ -103,11 +137,11 @@ def cmd_scan(args) -> int:
     verdicts = probe_wasm(wasm, entries, os.path.join(scratch, "verdicts.json"))
     print(f"\n{args.contract_id}: {len(verdicts)} probes")
     for v in verdicts:
-        mark = "BREACH" if v["verdict"] == "breach" else v["verdict"]
+        mark = {"breach": "BREACH", "chain": "CHAIN"}.get(v["verdict"], v["verdict"])
         print(f"  [{mark:<7}] {v['fn']}({v['arg_types']})  {v['detail']}")
-    breaches = [v for v in verdicts if v["verdict"] == "breach"]
-    if breaches:
-        print("\nNOTE: fresh-deploy probing. A breach here is a CANDIDATE — confirm against "
+    findings = [v for v in verdicts if v["verdict"] in ("breach", "chain")]
+    if findings:
+        print("\nNOTE: fresh-deploy probing. A finding here is a CANDIDATE — confirm against "
               "a state-fork before any disclosure. Never touch the live contract.")
     return 0
 

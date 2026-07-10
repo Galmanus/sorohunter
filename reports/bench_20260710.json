@@ -1,0 +1,172 @@
+{
+  "evaluation": {
+    "tp": 2,
+    "fp": 0,
+    "fn": 0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "per_contract": [
+      {
+        "contract": "vuln_vault",
+        "flagged": [
+          "withdraw"
+        ],
+        "expected": [
+          "withdraw"
+        ],
+        "tp": [
+          "withdraw"
+        ],
+        "fp": [],
+        "fn": []
+      },
+      {
+        "contract": "safe_vault",
+        "flagged": [],
+        "expected": [],
+        "tp": [],
+        "fp": [],
+        "fn": []
+      },
+      {
+        "contract": "chain_vault",
+        "flagged": [
+          "set_admin->withdraw"
+        ],
+        "expected": [
+          "set_admin->withdraw"
+        ],
+        "tp": [
+          "set_admin->withdraw"
+        ],
+        "fp": [],
+        "fn": []
+      },
+      {
+        "contract": "safe_chain_vault",
+        "flagged": [],
+        "expected": [],
+        "tp": [],
+        "fp": [],
+        "fn": []
+      }
+    ]
+  },
+  "results": [
+    {
+      "contract": "vuln_vault",
+      "wasm": "/home/galmanus/sorohunter/bench/target/wasm32v1-none/release/vuln_vault.wasm",
+      "verdicts": [
+        {
+          "fn": "balance",
+          "arg_types": "address",
+          "verdict": "view",
+          "events_delta": 0,
+          "detail": "succeeded, no event \u2014 read-only"
+        },
+        {
+          "fn": "deposit",
+          "arg_types": "address,i128",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        },
+        {
+          "fn": "withdraw",
+          "arg_types": "address,i128",
+          "verdict": "breach",
+          "events_delta": 1,
+          "detail": "succeeded and emitted an event under empty auth \u2014 state change without a signature"
+        }
+      ]
+    },
+    {
+      "contract": "safe_vault",
+      "wasm": "/home/galmanus/sorohunter/bench/target/wasm32v1-none/release/safe_vault.wasm",
+      "verdicts": [
+        {
+          "fn": "balance",
+          "arg_types": "address",
+          "verdict": "view",
+          "events_delta": 0,
+          "detail": "succeeded, no event \u2014 read-only"
+        },
+        {
+          "fn": "deposit",
+          "arg_types": "address,i128",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        },
+        {
+          "fn": "withdraw",
+          "arg_types": "address,i128",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        }
+      ]
+    },
+    {
+      "contract": "chain_vault",
+      "wasm": "/home/galmanus/sorohunter/bench/target/wasm32v1-none/release/chain_vault.wasm",
+      "verdicts": [
+        {
+          "fn": "pot",
+          "arg_types": "",
+          "verdict": "view",
+          "events_delta": 0,
+          "detail": "succeeded, no event \u2014 read-only"
+        },
+        {
+          "fn": "withdraw",
+          "arg_types": "i128",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        },
+        {
+          "fn": "set_admin",
+          "arg_types": "address",
+          "verdict": "view",
+          "events_delta": 0,
+          "detail": "succeeded, no event \u2014 read-only"
+        },
+        {
+          "fn": "set_admin->withdraw",
+          "arg_types": "",
+          "verdict": "chain",
+          "events_delta": 0,
+          "detail": "foothold set_admin() under empty auth seized control, unlocking gated withdraw() for the attacker \u2014 composition, PoC is the executed sequence"
+        }
+      ]
+    },
+    {
+      "contract": "safe_chain_vault",
+      "wasm": "/home/galmanus/sorohunter/bench/target/wasm32v1-none/release/safe_chain_vault.wasm",
+      "verdicts": [
+        {
+          "fn": "pot",
+          "arg_types": "",
+          "verdict": "view",
+          "events_delta": 0,
+          "detail": "succeeded, no event \u2014 read-only"
+        },
+        {
+          "fn": "withdraw",
+          "arg_types": "i128",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        },
+        {
+          "fn": "set_admin",
+          "arg_types": "address",
+          "verdict": "held",
+          "events_delta": 0,
+          "detail": "aborted under empty auth"
+        }
+      ]
+    }
+  ]
+}
