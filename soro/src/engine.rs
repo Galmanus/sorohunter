@@ -476,6 +476,159 @@ pub fn probe_greed(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &st
     out
 }
 
+/// Read the contract's admin/owner address via a standard getter. Tries the
+/// common Soroban names and returns the first that answers with an `Address`.
+/// `None` if the contract exposes no readable admin — then there is nothing to
+/// compare and the hijack check abstains.
+fn read_admin(env: &Env, contract: &str) -> Option<std::string::String> {
+    let caddr = Address::from_string(&SString::from_str(env, contract));
+    for getter in ["admin", "get_admin", "owner", "get_owner"] {
+        let args = SVec::new(env);
+        if let Ok(Ok(a)) =
+            env.try_invoke_contract::<Address, soroban_sdk::Error>(&caddr, &Symbol::new(env, getter), args)
+        {
+            return addr_to_str(&a);
+        }
+    }
+    None
+}
+
+/// Admin-capture (privilege escalation) check for one fn, in an already-forked
+/// `env`. The attacker-auth trick that saves `greed` (state-gating survives
+/// `mock_all_auths`) does NOT apply here: an admin gate is an *auth* check, and
+/// mocking all auths would let a correctly-gated `set_admin` through — a false
+/// positive. So this runs under EMPTY auth like `probe_drain`: a correct setter
+/// calls `current_admin.require_auth()` and reverts, leaving the admin unchanged;
+/// an unprotected setter reassigns the admin to the attacker-supplied address and
+/// is flagged. Unlike the event-delta `breach` probe, this reads the admin getter
+/// and confirms *who* holds control, so it also catches silent setters that emit
+/// no event (which `breach` misses). Returns the finding or `None`.
+fn hijack_check_in_env(env: &Env, contract: &str, p: &FnPlan) -> Option<Verdict> {
+    let attacker = Address::generate(env);
+    let attacker_str = addr_to_str(&attacker)?;
+    let admin_before = read_admin(env, contract)?;
+    if admin_before == attacker_str {
+        return None;
+    }
+    let caddr = Address::from_string(&SString::from_str(env, contract));
+    let args = build_args(env, &p.inputs, Some(&attacker))?;
+    env.set_auths(&[]);
+    let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &p.name), args);
+    let admin_after = read_admin(env, contract)?;
+    if admin_after != admin_before && admin_after == attacker_str {
+        return Some(Verdict {
+            fn_name: p.name.clone(),
+            arg_types: p.inputs.join(","),
+            verdict: "hijack".into(),
+            events_delta: 0,
+            detail: format!(
+                "OBJ-HIJACK: {}() under EMPTY auth reassigned the contract admin/owner to the attacker-supplied address — unprotected privilege setter (missing current-admin require_auth), CONFIRMED against forked state",
+                p.name
+            ),
+        });
+    }
+    None
+}
+
+/// Admin-capture detector: the role-capture sibling of `probe_drain`/`probe_greed`.
+/// For each mutating fn that takes an address, in a fresh forked env, inject the
+/// attacker's address under empty auth and flag any fn that leaves the attacker
+/// holding the contract's admin/owner role (see `hijack_check_in_env`).
+pub fn probe_hijack(source: Rc<RpcSnapshotSource>, li: &LedgerInfo, contract: &str, plan: &[FnPlan]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    for p in plan
+        .iter()
+        .filter(|p| p.synthesizable && p.inputs.iter().any(|t| t == "address") && p.name != "__constructor")
+    {
+        let env = forked_env(source.clone(), li);
+        if let Some(v) = hijack_check_in_env(&env, contract, p) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod hijack_tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    #[contracttype]
+    enum AKey {
+        Admin,
+    }
+
+    // VULN: `set_admin` overwrites the admin with no current-admin auth check —
+    // the unprotected privilege-setter class (TA-02). Anyone can seize control.
+    #[contract]
+    struct VulnAdmin;
+    #[contractimpl]
+    impl VulnAdmin {
+        pub fn __constructor(e: Env, admin: Address) {
+            e.storage().instance().set(&AKey::Admin, &admin);
+        }
+        pub fn admin(e: Env) -> Address {
+            e.storage().instance().get(&AKey::Admin).unwrap()
+        }
+        pub fn set_admin(e: Env, new_admin: Address) {
+            e.storage().instance().set(&AKey::Admin, &new_admin);
+        }
+    }
+
+    // CORRECT: `set_admin` requires the CURRENT admin's auth before rotating; under
+    // empty auth it reverts and the admin is unchanged.
+    #[contract]
+    struct SafeAdmin;
+    #[contractimpl]
+    impl SafeAdmin {
+        pub fn __constructor(e: Env, admin: Address) {
+            e.storage().instance().set(&AKey::Admin, &admin);
+        }
+        pub fn admin(e: Env) -> Address {
+            e.storage().instance().get(&AKey::Admin).unwrap()
+        }
+        pub fn set_admin(e: Env, new_admin: Address) {
+            let cur: Address = e.storage().instance().get(&AKey::Admin).unwrap();
+            cur.require_auth();
+            e.storage().instance().set(&AKey::Admin, &new_admin);
+        }
+    }
+
+    fn plan(name: &str) -> FnPlan {
+        FnPlan {
+            name: name.into(),
+            inputs: std::vec!["address".into()],
+            synthesizable: true,
+            skip_reason: None,
+        }
+    }
+
+    // The bracket: a stub returning None fails recall, a stub returning Some fails
+    // precision — only a detector that discriminates unprotected-vs-gated passes both.
+    #[test]
+    fn hijack_flags_unprotected_set_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let orig_admin = Address::generate(&env);
+        let vault = env.register(VulnAdmin, (orig_admin,));
+        let contract = addr_to_str(&vault).unwrap();
+        let v = hijack_check_in_env(&env, &contract, &plan("set_admin"));
+        assert!(v.is_some(), "hijack detector must flag an unprotected set_admin");
+        assert_eq!(v.unwrap().verdict, "hijack");
+    }
+
+    #[test]
+    fn hijack_silent_on_gated_set_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let orig_admin = Address::generate(&env);
+        let vault = env.register(SafeAdmin, (orig_admin,));
+        let contract = addr_to_str(&vault).unwrap();
+        let v = hijack_check_in_env(&env, &contract, &plan("set_admin"));
+        assert!(v.is_none(), "hijack detector must NOT flag a current-admin-gated set_admin");
+    }
+}
+
 #[cfg(test)]
 mod greed_tests {
     use super::*;
