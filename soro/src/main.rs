@@ -125,13 +125,64 @@ fn cmd_probe(wasms: &[String]) -> i32 {
     0
 }
 
+/// Acquire a public contract read-only (fetch WASM + spec via the stellar CLI)
+/// and probe a local fork. Never touches the deployed contract.
+fn cmd_scan(id: &str, network: &str) -> i32 {
+    eprintln!("acquiring {} ({}) — read-only ...", id, network);
+    let tmp = std::env::temp_dir().join(format!("soro_scan_{}.wasm", id));
+    let tmps = tmp.to_string_lossy().into_owned();
+    let fetched = Command::new("stellar")
+        .args(["contract", "fetch", "--id", id, "--network", network, "--out-file", &tmps])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !fetched {
+        eprintln!("fetch failed");
+        return 1;
+    }
+    let entries = abi_entries(&["--id", id, "--network", network]);
+    if entries.is_empty() {
+        eprintln!("no contract spec found");
+        return 1;
+    }
+    let plan = abi::parse_spec(&entries);
+    let wasm = std::fs::read(&tmp).unwrap_or_default();
+    let verdicts = engine::probe_contract(&wasm, ATTACKER, &plan);
+
+    println!("\n{}: {} probes", id, verdicts.len());
+    for v in &verdicts {
+        println!("  [{:<7}] {}({})  {}", report::mark(&v.verdict), v.fn_name, v.arg_types, v.detail);
+    }
+    if !report::findings(&verdicts).is_empty() {
+        println!(
+            "\nNOTE: fresh-deploy probing. A finding here is a CANDIDATE — confirm against \
+             a state-fork before any disclosure. Never touch the live contract."
+        );
+    }
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("bench") => cmd_bench(),
         Some("probe") if args.len() > 1 => cmd_probe(&args[1..]),
+        Some("scan") if args.len() > 1 => {
+            let id = args[1].clone();
+            let mut network = "testnet".to_string();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--network" && i + 1 < args.len() {
+                    network = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            cmd_scan(&id, &network)
+        }
         _ => {
-            eprintln!("usage: sorohunter <bench | probe <wasm...>>");
+            eprintln!("usage: sorohunter <bench | probe <wasm...> | scan <id> [--network <net>]>");
             2
         }
     };
