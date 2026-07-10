@@ -440,8 +440,18 @@ fn greed_check_in_env(env: &Env, contract: &str, tokens: &[String], p: &FnPlan) 
         tokens.iter().map(|t| token_balance(env, t, &attacker_str)).collect();
     let caddr = Address::from_string(&SString::from_str(env, contract));
     let args = build_args(env, &p.inputs, Some(&attacker))?;
-    env.mock_all_auths();
-    let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &Symbol::new(env, &p.name), args);
+    // Scope the forged signature to the ATTACKER only — not `mock_all_auths`, which
+    // also fakes an admin/factory signature and makes every auth-gated fee/collect
+    // function look drainable. Under attacker-only auth, a fn that needs a specific
+    // privileged signer reverts (correctly silent); only a fn that pays whoever
+    // authorizes themselves from a zero position survives — the real greed class.
+    let sym = Symbol::new(env, &p.name);
+    env.set_auths(&[]);
+    env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke { contract: &caddr, fn_name: &p.name, args: args.clone(), sub_invokes: &[] },
+    }]);
+    let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&caddr, &sym, args);
     for (i, t) in tokens.iter().enumerate() {
         let after = token_balance(env, t, &attacker_str);
         if let (Some(b), Some(a)) = (before[i], after) {
@@ -452,7 +462,7 @@ fn greed_check_in_env(env: &Env, contract: &str, tokens: &[String], p: &FnPlan) 
                     verdict: "greed".into(),
                     events_delta: 0,
                     detail: format!(
-                        "OBJ-GREED: {}() under attacker auth paid the caller {} of {} from a zero position — authorized-but-unearned value extraction (broken accounting / unchecked payout), CONFIRMED against forked state",
+                        "OBJ-GREED: {}() paid the attacker {} of {} from a zero position under the attacker's OWN authorization (no privileged signer needed) — authorized-but-unearned value extraction (broken accounting / unchecked payout), CONFIRMED against forked state",
                         p.name, a - b, t
                     ),
                 });
@@ -1404,6 +1414,27 @@ mod greed_tests {
     #[contracttype]
     enum GKey {
         Token,
+        Admin,
+    }
+
+    // CORRECT-but-privileged: `collect` pays a recipient from reserves but only the
+    // stored ADMIN may authorize it. `mock_all_auths` would fake the admin's
+    // signature and flag this as greed (a false positive on every fee/collect fn);
+    // attacker-scoped auth must leave it silent.
+    #[contract]
+    struct AdminCollectVault;
+    #[contractimpl]
+    impl AdminCollectVault {
+        pub fn __constructor(e: Env, token: Address, admin: Address) {
+            e.storage().instance().set(&GKey::Token, &token);
+            e.storage().instance().set(&GKey::Admin, &admin);
+        }
+        pub fn collect(e: Env, recipient: Address, amount: i128) {
+            let admin: Address = e.storage().instance().get(&GKey::Admin).unwrap();
+            admin.require_auth();
+            let t: Address = e.storage().instance().get(&GKey::Token).unwrap();
+            token::Client::new(&e, &t).transfer(&e.current_contract_address(), &recipient, &amount);
+        }
     }
 
     // VULN: `claim` pays any authorizing caller from reserves with no eligibility
@@ -1490,5 +1521,22 @@ mod greed_tests {
         let tokens = std::vec![addr_to_str(&token_addr).unwrap()];
         let v = greed_check_in_env(&env, &contract, &tokens, &plan("withdraw"));
         assert!(v.is_none(), "greed detector must NOT flag a correctly-gated withdraw");
+    }
+
+    // Regression for the admin-gate false positive found in the mainnet hunt
+    // (collect_protocol on a live pool): an admin-only collect must stay silent
+    // under attacker-scoped auth, where mock_all_auths would have flagged it.
+    #[test]
+    fn greed_silent_on_admin_gated_collect() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token_addr = make_token(&env);
+        let admin = Address::generate(&env);
+        let vault = env.register(AdminCollectVault, (token_addr.clone(), admin));
+        mint(&env, &token_addr, &vault, 1_000);
+        let contract = addr_to_str(&vault).unwrap();
+        let tokens = std::vec![addr_to_str(&token_addr).unwrap()];
+        let v = greed_check_in_env(&env, &contract, &tokens, &plan("collect"));
+        assert!(v.is_none(), "attacker-scoped greed must NOT flag an admin-gated collect (the mock_all_auths FP)");
     }
 }
