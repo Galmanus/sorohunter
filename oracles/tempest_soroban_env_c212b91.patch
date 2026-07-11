@@ -1,0 +1,362 @@
+diff --git a/soroban-env-host/src/host/comparison.rs b/soroban-env-host/src/host/comparison.rs
+index fa63e3d..3781e32 100644
+--- a/soroban-env-host/src/host/comparison.rs
++++ b/soroban-env-host/src/host/comparison.rs
+@@ -802,4 +802,182 @@ mod tests {
+ 
+         ex
+     }
++
++    // ---- TEMPEST order-theory oracle (adapted from T3MP3ST committed-ground-truth discipline) ----
++    // Ground-truth = the algebraic axioms of a total order + consistency with `Ord for ScVal`.
++    // A violation is a concrete, reproducible tuple, not a self-report.
++    fn tempest_corpus(host: &Host) -> Vec<(String, Val)> {
++        use crate::xdr;
++        let mut v: Vec<(String, Val)> = Vec::new();
++        // base: one example per tag (reuse their coverage)
++        for t in all_tags() {
++            v.push((format!("tag:{:?}", t), example_for_tag(host, t)));
++        }
++        // adversarial symbols straddling the 9-char small/object boundary
++        for s in ["", "a", "b", "z", "A", "_",
++                  "aaaaaaaaa", "zzzzzzzzz", "bbbbbbbbb",           // 9 chars -> SymbolSmall
++                  "aaaaaaaaaa", "zzzzzzzzzz", "bbbbbbbbbb",        // 10 chars -> SymbolObject
++                  "aaaaaaaaaaa", "a_very_big_symbol"] {
++            if let Ok(sy) = xdr::ScSymbol::try_from(s) {
++                if let Ok(val) = Val::try_from_val(host, &ScVal::Symbol(sy)) {
++                    v.push((format!("sym:{:?}", s), val));
++                }
++            }
++        }
++        // numbers straddling the 56-bit small/object boundary, both signs
++        let boundary_u: [u64; 6] = [0, 1, 0x00ff_ffff_ffff_ffff, 0x0100_0000_0000_0000, u64::MAX/2, u64::MAX];
++        for n in boundary_u {
++            v.push((format!("u64:{}", n), Val::try_from_val(host, &n).unwrap()));
++            v.push((format!("u128:{}", n as u128), Val::try_from_val(host, &(n as u128)).unwrap()));
++        }
++        for n in [-1i64, -(0x00ff_ffff_ffff_ffffi64), i64::MIN, 0, 1, i64::MAX] {
++            v.push((format!("i64:{}", n), Val::try_from_val(host, &n).unwrap()));
++        }
++        // bytes / strings: empty vs prefix vs greater
++        for b in [vec![], vec![0u8], vec![1u8], vec![1u8,2], vec![2u8]] {
++            v.push((format!("bytes:{:?}", b), Val::try_from_val(host, &b).unwrap()));
++        }
++        // vecs straddling element-order (element compare inherits Val order)
++        for tup in [
++            Val::try_from_val(host, &ScVal::Vec(Some(xdr::ScVec::try_from((0u32,)).unwrap()))),
++            Val::try_from_val(host, &ScVal::Vec(Some(xdr::ScVec::try_from((1u32,)).unwrap()))),
++        ] {
++            if let Ok(val) = tup { v.push(("vec:elem".into(), val)); }
++        }
++        v
++    }
++
++    // The oracle body: runs the three axiom checks over any corpus, returns violation
++    // counts + the first counterexamples. Reused by the hand-corpus and fuzz tests.
++    fn tempest_run_oracle(host: &Host, corpus: &[(String, Val)]) -> (usize, usize, usize, Vec<String>) {
++        use std::cmp::Ordering::*;
++        let n = corpus.len();
++        let scvals: Vec<Option<ScVal>> = corpus.iter()
++            .map(|(_, val)| ScVal::try_from_val(host, val).ok())
++            .collect();
++        let mut consistency_viol = 0usize;
++        let mut antisym_viol = 0usize;
++        let mut transit_viol = 0usize;
++        let mut first: Vec<String> = Vec::new();
++
++        for i in 0..n {
++            for j in 0..n {
++                let (ci, cji) = match (host.compare(&corpus[i].1, &corpus[j].1),
++                                       host.compare(&corpus[j].1, &corpus[i].1)) {
++                    (Ok(a), Ok(b)) => (a, b),
++                    _ => continue,
++                };
++                if ci != cji.reverse() {
++                    antisym_viol += 1;
++                    if first.len() < 10 {
++                        first.push(format!("ANTISYM  {} vs {}: ab={:?} ba={:?}",
++                            corpus[i].0, corpus[j].0, ci, cji));
++                    }
++                }
++                if let (Some(si), Some(sj)) = (&scvals[i], &scvals[j]) {
++                    let sc = si.cmp(sj);
++                    if ci != sc {
++                        consistency_viol += 1;
++                        if first.len() < 10 {
++                            first.push(format!("SCVAL≠VAL {} vs {}: val={:?} scval={:?}",
++                                corpus[i].0, corpus[j].0, ci, sc));
++                        }
++                    }
++                }
++            }
++        }
++        for i in 0..n {
++            for j in 0..n {
++                let cij = match host.compare(&corpus[i].1, &corpus[j].1) { Ok(o)=>o, _=>continue };
++                if cij == Greater { continue; }
++                for k in 0..n {
++                    let cjk = match host.compare(&corpus[j].1, &corpus[k].1) { Ok(o)=>o, _=>continue };
++                    if cjk == Greater { continue; }
++                    let cik = match host.compare(&corpus[i].1, &corpus[k].1) { Ok(o)=>o, _=>continue };
++                    if cik == Greater {
++                        transit_viol += 1;
++                        if first.len() < 14 {
++                            first.push(format!("TRANSIT  {} <= {} <= {}  BUT first>last",
++                                corpus[i].0, corpus[j].0, corpus[k].0));
++                        }
++                    }
++                }
++            }
++        }
++        (consistency_viol, antisym_viol, transit_viol, first)
++    }
++
++    fn tempest_report(label: &str, n: usize, r: (usize, usize, usize, Vec<String>)) {
++        let (c, a, t, first) = r;
++        println!("\n=== TEMPEST Val order oracle [{}] ===", label);
++        println!("corpus {}  (pairs {}, triples {})", n, n*n, n*n*n);
++        println!("consistency(ScVal!=Val): {}   antisymmetry: {}   transitivity: {}", c, a, t);
++        for f in &first { println!("  {}", f); }
++        if c==0 && a==0 && t==0 {
++            println!("  (none) — total order consistent with ScVal on this corpus");
++        }
++    }
++
++    #[test]
++    fn tempest_val_total_order_oracle() {
++        let host = Host::default();
++        let corpus = tempest_corpus(&host);
++        let n = corpus.len();
++        tempest_report("hand-adversarial", n, tempest_run_oracle(&host, &corpus));
++    }
++
++    // Hand-rolled recursive random ScVal generator (deterministic xorshift seed →
++    // reproducible). Biased toward nested Vecs — the recursive/length-tiebreak path
++    // is where container-order transitivity would break if element order isn't total.
++    fn rand_scval(next: &mut dyn FnMut() -> u64, depth: u32) -> ScVal {
++        use crate::xdr;
++        let pick = next() % if depth == 0 { 8 } else { 10 };
++        match pick {
++            0 => ScVal::U32((next() & 0xff) as u32),
++            1 => ScVal::I32(((next() & 0xff) as i32) - 128),
++            2 => ScVal::U64(next() % 0x0200_0000_0000_0000), // straddles 56-bit small/object
++            3 => ScVal::U128(xdr::UInt128Parts { hi: next() % 3, lo: next() }),
++            4 => ScVal::U256(xdr::UInt256Parts { hi_hi: 0, hi_lo: next()%2, lo_hi: next()%2, lo_lo: next() }),
++            5 => {
++                let len = (next() % 11) as usize; // 0..10 → straddles the 9-char boundary
++                let alpha = b"ab_z";
++                let s: String = (0..len).map(|_| alpha[(next() as usize) % alpha.len()] as char).collect();
++                ScVal::Symbol(xdr::ScSymbol::try_from(s.as_str()).unwrap_or_else(|_| xdr::ScSymbol::try_from("").unwrap()))
++            }
++            6 => {
++                let len = (next() % 4) as usize;
++                let b: Vec<u8> = (0..len).map(|_| (next() & 0x3) as u8).collect();
++                ScVal::Bytes(xdr::ScBytes::try_from(b).unwrap())
++            }
++            7 => ScVal::Bool(next() & 1 == 0),
++            _ => {
++                // nested Vec (depth-limited)
++                let len = (next() % 4) as usize;
++                let elems: Vec<ScVal> = (0..len).map(|_| rand_scval(next, depth.saturating_sub(1))).collect();
++                match elems.try_into() {
++                    Ok(vm) => ScVal::Vec(Some(xdr::ScVec(vm))),
++                    Err(_) => ScVal::Void,
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn tempest_val_order_fuzz() {
++        let host = Host::default();
++        let mut state: u64 = 0x9E3779B97F4A7C15; // fixed seed → reproducible
++        let mut next = move || { state ^= state<<13; state ^= state>>7; state ^= state<<17; state };
++        let mut corpus: Vec<(String, Val)> = Vec::new();
++        let mut attempts = 0;
++        while corpus.len() < 240 && attempts < 40000 {
++            attempts += 1;
++            let scv = rand_scval(&mut next, 3);
++            if let Ok(val) = Val::try_from_val(&host, &scv) {
++                corpus.push((format!("fz{}", corpus.len()), val));
++            }
++        }
++        let n = corpus.len();
++        tempest_report("recursive-fuzz", n, tempest_run_oracle(&host, &corpus));
++        assert!(n > 40, "fuzz corpus too small ({})", n);
++    }
+ }
+diff --git a/soroban-env-host/src/test/auth.rs b/soroban-env-host/src/test/auth.rs
+index 3667d3a..2aff8b4 100644
+--- a/soroban-env-host/src/test/auth.rs
++++ b/soroban-env-host/src/test/auth.rs
+@@ -3718,3 +3718,49 @@ fn test_instance_storage_in_check_auth_with_reentrance() {
+     do_call("pre_post", 1, true);
+     assert_eq!(get_key_increase(), 3);
+ }
++
++// ---- TEMPEST auth oracle: AX-03 classic-account auth always checks MEDIUM ----
++// Executed ground-truth: a classic G... account authorizes any Soroban require_auth at
++// the MEDIUM threshold; there is no path to the HIGH threshold. A treasury that assumes
++// its high-threshold signer policy protects large token transfers is only med-protected.
++#[test]
++fn tempest_ax03_classic_auth_always_medium() {
++    use crate::builtin_contracts::account_contract::check_account_authentication;
++    use crate::builtin_contracts::testutils::{
++        create_account, generate_signing_key, sign_payload_for_account, signing_key_to_account_id,
++    };
++    use soroban_env_common::{EnvBase, TryIntoVal, Val};
++
++    let host = Host::test_host_with_recording_footprint();
++    host.set_base_prng_seed([0u8; 32]).unwrap();
++
++    let payload_bytes = [7u8; 32];
++
++    // helper: account identity is a DISTINCT key (master_weight 0); `signer` is an
++    // additional signer whose weight we control. thresholds = [master, low, MED, HIGH].
++    let authenticate = |signer_weight: u32| -> Result<(), HostError> {
++        let account_key = generate_signing_key(&host); // master (weight 0), unused for signing
++        let signer = generate_signing_key(&host);      // additional signer
++        let account_id = signing_key_to_account_id(&account_key);
++        create_account(
++            &host, &account_id, &[(&signer, signer_weight)],
++            100_000_000, 0, [0, 1, 10, 20], None, None, 0,
++        );
++        let payload = host.bytes_new_from_slice(&payload_bytes).unwrap();
++        let sig = sign_payload_for_account(&host, &signer, &payload_bytes);
++        let sig_val: Val = sig.try_into_val(&host).unwrap();
++        let sigs = host.vec_new_from_slice(&[sig_val]).unwrap();
++        check_account_authentication(&host, account_id, payload, sigs.to_val())
++    };
++
++    let res_med = authenticate(10);  // == MED (10), < HIGH (20)
++    let res_below = authenticate(9); // < MED
++
++    println!("\n=== TEMPEST auth oracle [AX-03 classic always-MEDIUM] ===");
++    println!("account thresholds [master,low,MED,HIGH] = [0,1,10,20]");
++    println!("weight 10 (== MED, < HIGH) authorizes: {}   res={:?}", res_med.is_ok(), res_med);
++    println!("weight 9  (< MED) rejected:            {}", res_below.is_err());
++    assert!(res_med.is_ok(), "AX-03: weight==MED must authorize a Soroban op");
++    assert!(res_below.is_err(), "control: weight<MED must be rejected");
++    println!("AX-03 CONFIRMED (executed): Soroban classic-account auth authorizes at MEDIUM; HIGH (20) is unreachable — a high-threshold treasury is only med-protected for Soroban ops");
++}
+diff --git a/soroban-env-host/src/test/bls12_381.rs b/soroban-env-host/src/test/bls12_381.rs
+index 04b4d01..2cdd1f6 100644
+--- a/soroban-env-host/src/test/bls12_381.rs
++++ b/soroban-env-host/src/test/bls12_381.rs
+@@ -1985,3 +1985,116 @@ fn g2_is_on_curve() -> Result<(), HostError> {
+ 
+     Ok(())
+ }
++
++// ---- TEMPEST field-theory oracle: TZ-02b scalar representative aliasing ----
++// Ground-truth (executed, not inferred): two DISTINCT U256 representatives s and s+r
++// collapse to the SAME Fr scalar via from_le_bytes_mod_order, while remaining distinct
++// as raw U256 keys. That gap is the nullifier-malleability / double-spend primitive.
++#[test]
++fn tempest_fr_scalar_aliasing_tz02b() -> Result<(), HostError> {
++    use ark_ec::AffineRepr;
++    use soroban_env_common::Compare;
++    let host = observe_host!(Host::test_host());
++    host.budget_ref().reset_default()?;
++
++    // BLS12-381 scalar-field modulus r = 0x73eda753299d7d48 3339d80809a1d805
++    //                                    53bda402fffe5bfe ffffffff00000001
++    let (r_hh, r_hl, r_lh, r_ll) = (
++        0x73eda753299d7d48u64,
++        0x3339d80809a1d805u64,
++        0x53bda402fffe5bfeu64,
++        0xffffffff00000001u64,
++    );
++    let s: u64 = 5; // small, so s+r has no limb carry (r_ll + 5 < 2^64)
++
++    let s_val: U256Val = host.obj_from_u256_pieces(0, 0, 0, s)?.into();
++    let spr_val: U256Val = host.obj_from_u256_pieces(r_hh, r_hl, r_lh, r_ll + s)?.into();
++
++    // (a) raw U256 nullifier keys are DISTINCT (what a dedup set stores)
++    let raw_cmp = (*host).compare(&s_val.to_val(), &spr_val.to_val())?;
++    let keys_distinct = raw_cmp != Ordering::Equal;
++
++    // (b) derived Fr scalars are IDENTICAL (silent mod-r reduction) — the aliasing
++    let fr_s = host.fr_from_u256val(s_val)?;
++    let fr_spr = host.fr_from_u256val(spr_val)?;
++    let fr_alias = fr_s == fr_spr;
++
++    // (c) contract consequence: g1_mul(base, s) == g1_mul(base, s+r) — identical proof/point
++    let base = G1Affine::generator();
++    let p_s = host.g1_mul_internal(base, fr_s)?;
++    let p_spr = host.g1_mul_internal(base, fr_spr)?;
++    let point_same = p_s == p_spr;
++
++    println!("\n=== TEMPEST field oracle [TZ-02b scalar aliasing] ===");
++    println!("raw U256 nullifier keys distinct: {}", keys_distinct);
++    println!("Fr(s) == Fr(s+r):                 {}   <- silent mod-r reduction", fr_alias);
++    println!("g1_mul(base,s) == g1_mul(base,s+r): {}   <- double-spend primitive", point_same);
++
++    assert!(keys_distinct, "s and s+r are the SAME U256 key — no double-spend gap");
++    assert!(fr_alias, "TZ-02b REFUTED: s and s+r did NOT alias to the same Fr");
++    assert!(point_same, "points differ despite equal scalars");
++    println!("TZ-02b CONFIRMED (executed): distinct dedup key, identical scalar AND curve point");
++    Ok(())
++}
++
++// TZ-05: g1_add validates CheckOnCurve only; a non-subgroup (torsion-tainted) point
++// that g1_mul/pairing reject is ACCEPTED by the add path. Executed ground-truth.
++#[test]
++fn tempest_g1_add_subgroup_omission_tz05() -> Result<(), HostError> {
++    use crate::crypto::PointValidationMode;
++    let host = observe_host!(Host::test_host());
++    host.budget_ref().reset_default()?;
++
++    // find an on-curve G1 point NOT in the prime-order subgroup (generic x → prob ~1-2^-76)
++    let mut p = None;
++    for i in 1u64..2000 {
++        if let Some(cand) = G1Affine::get_point_from_x_unchecked(Fq::from(i), true) {
++            if !cand.is_in_correct_subgroup_assuming_on_curve() {
++                p = Some(cand);
++                break;
++            }
++        }
++    }
++    let p = p.expect("no non-subgroup on-curve point found in range");
++    let mut buf = vec![0u8; G1_SERIALIZED_SIZE];
++    host.serialize_uncompressed_into_slice::<G1_SERIALIZED_SIZE, _>(&p, &mut buf, "tz05")?;
++    let bo = host.bytes_new_from_slice(&buf)?;
++
++    let as_add = host.g1_affine_deserialize_from_bytesobj(bo, PointValidationMode::CheckOnCurve);
++    let as_mul = host.g1_affine_deserialize_from_bytesobj(bo, PointValidationMode::CheckOnCurveAndInSubgroup);
++
++    println!("\n=== TEMPEST field oracle [TZ-05 subgroup omission] ===");
++    println!("point in prime-order subgroup:          {}", p.is_in_correct_subgroup_assuming_on_curve());
++    println!("g1_add path (CheckOnCurve) accepts:     {}", as_add.is_ok());
++    println!("g1_mul path (Check+Subgroup) accepts:   {}", as_mul.is_ok());
++    assert!(as_add.is_ok(), "add-path should accept the non-subgroup point");
++    assert!(as_mul.is_err(), "mul-path should reject the non-subgroup point");
++    println!("TZ-05 CONFIRMED (executed): g1_add accepts a torsion-tainted point that g1_mul/pairing reject");
++    Ok(())
++}
++
++// FAULT-1: one U256Val type carries two moduli — mod-2^256 under u256_* arithmetic,
++// mod-r under fr_from_u256val. r is nonzero as u256 but ≡ 0 as Fr.
++#[test]
++fn tempest_two_moduli_fault1() -> Result<(), HostError> {
++    use soroban_env_common::Compare;
++    let host = observe_host!(Host::test_host());
++    host.budget_ref().reset_default()?;
++    let (r_hh, r_hl, r_lh, r_ll) =
++        (0x73eda753299d7d48u64, 0x3339d80809a1d805u64, 0x53bda402fffe5bfeu64, 0xffffffff00000001u64);
++    let r_val: U256Val = host.obj_from_u256_pieces(r_hh, r_hl, r_lh, r_ll)?.into();
++    let zero_val: U256Val = host.obj_from_u256_pieces(0, 0, 0, 0)?.into();
++
++    let u256_nonzero = (*host).compare(&r_val.to_val(), &zero_val.to_val())? != Ordering::Equal;
++    let fr_r = host.fr_from_u256val(r_val)?;
++    let fr_zero = host.fr_from_u256val(zero_val)?;
++    let fr_equal = fr_r == fr_zero;
++
++    println!("\n=== TEMPEST field oracle [FAULT-1 two moduli] ===");
++    println!("r as u256 != 0:   {}   (mod-2^256 view)", u256_nonzero);
++    println!("fr(r) == fr(0):   {}   (mod-r view of the SAME U256Val type)", fr_equal);
++    assert!(u256_nonzero, "r must be nonzero as u256");
++    assert!(fr_equal, "FAULT-1 refuted: fr(r) != fr(0)");
++    println!("FAULT-1 CONFIRMED (executed): identical U256Val type means mod-2^256 (u256_*) AND mod-r (fr_*)");
++    Ok(())
++}
