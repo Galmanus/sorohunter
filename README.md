@@ -1,5 +1,28 @@
 # sorohunter
 
+```
+                    __                        __
+                   /  \______________________/  \
+                  |    \                    /    |
+                  |     \    /\        /\  /     |
+                   \     |  (  )      (  )|      /
+                    \    |   \/        \/ |     /
+                     \   |       /\       |    /
+                      \  |      (  )      |   /
+                       \ |      `--'      |  /
+                        \|   __________   |/
+                         |  /  G R R R  \ |
+                         | /   \      /  \|
+                         |/_____\____/____\
+                        _/                 \_
+                       /   |            |    \
+                      /   /|            |\    \
+                     (___/ |____________| \___)
+                          /  |        |  \
+                         (__/          \__)
+        s o r o h u n t e r  ·  it bites what it finds
+```
+
 **The fork-validated detector layer for the [Soroban ATT&CK](SOROBAN_ATTACK.md).**
 
 sorohunter points generic, ABI-driven adversary probes at deployed Stellar/Soroban
