@@ -158,18 +158,42 @@ fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
             min_temp_entry_ttl: 1,
             max_entry_ttl: 6_312_000,
         };
-        let source = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
-        let mut v = engine::probe_forked_lazy(source, &li, id, &plan);
+        // A scanner that must survive thousands of contracts cannot crash because one
+        // contract's forked execution panics inside the host (e.g. a heavy auth tree
+        // that trips `Budget/ExceededLimit` on an internal `.unwrap()` in soroban-env-host
+        // that we do not control). Isolate every probe: a host panic becomes a clean
+        // skip of that probe, never a process abort. Quiet the panic hook during the
+        // fork so a caught panic does not spam a backtrace.
+        let old_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let safe = |label: &str, f: &mut dyn FnMut() -> Vec<engine::Verdict>| -> Vec<engine::Verdict> {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!("  skip {} probe on {} — host panicked during fork (likely resource/limit); continuing", label, id);
+                    Vec::new()
+                }
+            }
+        };
+        let mut v = safe("forked_lazy", &mut || {
+            let s = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+            engine::probe_forked_lazy(s, &li, id, &plan)
+        });
         // Role-capture pass: the event-delta breach probe flags "something changed"
         // and misses silent admin setters entirely. probe_hijack reads the admin
         // getter and confirms an attacker seizing control — a sharper, higher-severity
         // finding on the same forked state.
-        let source_h = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
-        v.extend(engine::probe_hijack(source_h, &li, id, &plan));
+        v.extend(safe("hijack", &mut || {
+            let s = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+            engine::probe_hijack(s, &li, id, &plan)
+        }));
         // Temporal pass: the clock is an attacker. Flag one-shot guards that live
         // in temporary storage and evaporate past their TTL, reopening a replay.
-        let source_r = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
-        v.extend(engine::probe_replay(source_r, &li, id, &plan));
+        v.extend(safe("replay", &mut || {
+            let s = std::rc::Rc::new(fork::RpcSnapshotSource::new(url));
+            engine::probe_replay(s, &li, id, &plan)
+        }));
+        std::panic::set_hook(old_hook);
         v
     } else {
         eprintln!("acquiring {} ({}) — read-only via RPC ...", id, network);
