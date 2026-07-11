@@ -1,0 +1,178 @@
+    // ---- TEMPEST order-theory oracle (adapted from T3MP3ST committed-ground-truth discipline) ----
+    // Ground-truth = the algebraic axioms of a total order + consistency with `Ord for ScVal`.
+    // A violation is a concrete, reproducible tuple, not a self-report.
+    fn tempest_corpus(host: &Host) -> Vec<(String, Val)> {
+        use crate::xdr;
+        let mut v: Vec<(String, Val)> = Vec::new();
+        // base: one example per tag (reuse their coverage)
+        for t in all_tags() {
+            v.push((format!("tag:{:?}", t), example_for_tag(host, t)));
+        }
+        // adversarial symbols straddling the 9-char small/object boundary
+        for s in ["", "a", "b", "z", "A", "_",
+                  "aaaaaaaaa", "zzzzzzzzz", "bbbbbbbbb",           // 9 chars -> SymbolSmall
+                  "aaaaaaaaaa", "zzzzzzzzzz", "bbbbbbbbbb",        // 10 chars -> SymbolObject
+                  "aaaaaaaaaaa", "a_very_big_symbol"] {
+            if let Ok(sy) = xdr::ScSymbol::try_from(s) {
+                if let Ok(val) = Val::try_from_val(host, &ScVal::Symbol(sy)) {
+                    v.push((format!("sym:{:?}", s), val));
+                }
+            }
+        }
+        // numbers straddling the 56-bit small/object boundary, both signs
+        let boundary_u: [u64; 6] = [0, 1, 0x00ff_ffff_ffff_ffff, 0x0100_0000_0000_0000, u64::MAX/2, u64::MAX];
+        for n in boundary_u {
+            v.push((format!("u64:{}", n), Val::try_from_val(host, &n).unwrap()));
+            v.push((format!("u128:{}", n as u128), Val::try_from_val(host, &(n as u128)).unwrap()));
+        }
+        for n in [-1i64, -(0x00ff_ffff_ffff_ffffi64), i64::MIN, 0, 1, i64::MAX] {
+            v.push((format!("i64:{}", n), Val::try_from_val(host, &n).unwrap()));
+        }
+        // bytes / strings: empty vs prefix vs greater
+        for b in [vec![], vec![0u8], vec![1u8], vec![1u8,2], vec![2u8]] {
+            v.push((format!("bytes:{:?}", b), Val::try_from_val(host, &b).unwrap()));
+        }
+        // vecs straddling element-order (element compare inherits Val order)
+        for tup in [
+            Val::try_from_val(host, &ScVal::Vec(Some(xdr::ScVec::try_from((0u32,)).unwrap()))),
+            Val::try_from_val(host, &ScVal::Vec(Some(xdr::ScVec::try_from((1u32,)).unwrap()))),
+        ] {
+            if let Ok(val) = tup { v.push(("vec:elem".into(), val)); }
+        }
+        v
+    }
+
+    // The oracle body: runs the three axiom checks over any corpus, returns violation
+    // counts + the first counterexamples. Reused by the hand-corpus and fuzz tests.
+    fn tempest_run_oracle(host: &Host, corpus: &[(String, Val)]) -> (usize, usize, usize, Vec<String>) {
+        use std::cmp::Ordering::*;
+        let n = corpus.len();
+        let scvals: Vec<Option<ScVal>> = corpus.iter()
+            .map(|(_, val)| ScVal::try_from_val(host, val).ok())
+            .collect();
+        let mut consistency_viol = 0usize;
+        let mut antisym_viol = 0usize;
+        let mut transit_viol = 0usize;
+        let mut first: Vec<String> = Vec::new();
+
+        for i in 0..n {
+            for j in 0..n {
+                let (ci, cji) = match (host.compare(&corpus[i].1, &corpus[j].1),
+                                       host.compare(&corpus[j].1, &corpus[i].1)) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => continue,
+                };
+                if ci != cji.reverse() {
+                    antisym_viol += 1;
+                    if first.len() < 10 {
+                        first.push(format!("ANTISYM  {} vs {}: ab={:?} ba={:?}",
+                            corpus[i].0, corpus[j].0, ci, cji));
+                    }
+                }
+                if let (Some(si), Some(sj)) = (&scvals[i], &scvals[j]) {
+                    let sc = si.cmp(sj);
+                    if ci != sc {
+                        consistency_viol += 1;
+                        if first.len() < 10 {
+                            first.push(format!("SCVAL≠VAL {} vs {}: val={:?} scval={:?}",
+                                corpus[i].0, corpus[j].0, ci, sc));
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            for j in 0..n {
+                let cij = match host.compare(&corpus[i].1, &corpus[j].1) { Ok(o)=>o, _=>continue };
+                if cij == Greater { continue; }
+                for k in 0..n {
+                    let cjk = match host.compare(&corpus[j].1, &corpus[k].1) { Ok(o)=>o, _=>continue };
+                    if cjk == Greater { continue; }
+                    let cik = match host.compare(&corpus[i].1, &corpus[k].1) { Ok(o)=>o, _=>continue };
+                    if cik == Greater {
+                        transit_viol += 1;
+                        if first.len() < 14 {
+                            first.push(format!("TRANSIT  {} <= {} <= {}  BUT first>last",
+                                corpus[i].0, corpus[j].0, corpus[k].0));
+                        }
+                    }
+                }
+            }
+        }
+        (consistency_viol, antisym_viol, transit_viol, first)
+    }
+
+    fn tempest_report(label: &str, n: usize, r: (usize, usize, usize, Vec<String>)) {
+        let (c, a, t, first) = r;
+        println!("\n=== TEMPEST Val order oracle [{}] ===", label);
+        println!("corpus {}  (pairs {}, triples {})", n, n*n, n*n*n);
+        println!("consistency(ScVal!=Val): {}   antisymmetry: {}   transitivity: {}", c, a, t);
+        for f in &first { println!("  {}", f); }
+        if c==0 && a==0 && t==0 {
+            println!("  (none) — total order consistent with ScVal on this corpus");
+        }
+    }
+
+    #[test]
+    fn tempest_val_total_order_oracle() {
+        let host = Host::default();
+        let corpus = tempest_corpus(&host);
+        let n = corpus.len();
+        tempest_report("hand-adversarial", n, tempest_run_oracle(&host, &corpus));
+    }
+
+    // Hand-rolled recursive random ScVal generator (deterministic xorshift seed →
+    // reproducible). Biased toward nested Vecs — the recursive/length-tiebreak path
+    // is where container-order transitivity would break if element order isn't total.
+    fn rand_scval(next: &mut dyn FnMut() -> u64, depth: u32) -> ScVal {
+        use crate::xdr;
+        let pick = next() % if depth == 0 { 8 } else { 10 };
+        match pick {
+            0 => ScVal::U32((next() & 0xff) as u32),
+            1 => ScVal::I32(((next() & 0xff) as i32) - 128),
+            2 => ScVal::U64(next() % 0x0200_0000_0000_0000), // straddles 56-bit small/object
+            3 => ScVal::U128(xdr::UInt128Parts { hi: next() % 3, lo: next() }),
+            4 => ScVal::U256(xdr::UInt256Parts { hi_hi: 0, hi_lo: next()%2, lo_hi: next()%2, lo_lo: next() }),
+            5 => {
+                let len = (next() % 11) as usize; // 0..10 → straddles the 9-char boundary
+                let alpha = b"ab_z";
+                let s: String = (0..len).map(|_| alpha[(next() as usize) % alpha.len()] as char).collect();
+                ScVal::Symbol(xdr::ScSymbol::try_from(s.as_str()).unwrap_or_else(|_| xdr::ScSymbol::try_from("").unwrap()))
+            }
+            6 => {
+                let len = (next() % 4) as usize;
+                let b: Vec<u8> = (0..len).map(|_| (next() & 0x3) as u8).collect();
+                ScVal::Bytes(xdr::ScBytes::try_from(b).unwrap())
+            }
+            7 => ScVal::Bool(next() & 1 == 0),
+            _ => {
+                // nested Vec (depth-limited)
+                let len = (next() % 4) as usize;
+                let elems: Vec<ScVal> = (0..len).map(|_| rand_scval(next, depth.saturating_sub(1))).collect();
+                match elems.try_into() {
+                    Ok(vm) => ScVal::Vec(Some(xdr::ScVec(vm))),
+                    Err(_) => ScVal::Void,
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tempest_val_order_fuzz() {
+        let host = Host::default();
+        let mut state: u64 = 0x9E3779B97F4A7C15; // fixed seed → reproducible
+        let mut next = move || { state ^= state<<13; state ^= state>>7; state ^= state<<17; state };
+        let mut corpus: Vec<(String, Val)> = Vec::new();
+        let mut attempts = 0;
+        while corpus.len() < 240 && attempts < 40000 {
+            attempts += 1;
+            let scv = rand_scval(&mut next, 3);
+            if let Ok(val) = Val::try_from_val(&host, &scv) {
+                corpus.push((format!("fz{}", corpus.len()), val));
+            }
+        }
+        let n = corpus.len();
+        tempest_report("recursive-fuzz", n, tempest_run_oracle(&host, &corpus));
+        assert!(n > 40, "fuzz corpus too small ({})", n);
+    }
+}
