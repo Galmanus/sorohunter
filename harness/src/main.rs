@@ -14,9 +14,74 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use soroban_sdk::{
+    auth::{Context, ContractContext},
+    symbol_short,
     testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
-    Address, Bytes, Env, IntoVal, String as SString, Symbol, Val, Vec as SVec,
+    Address, Bytes, BytesN, Env, IntoVal, String as SString, Symbol, Val, Vec as SVec,
 };
+
+/// Vendored passkey-kit (smart-wallet) types, copied structurally from the
+/// target's published contract interface. Because `#[contracttype]` derives the
+/// exact same Val/XDR encoding from identical definitions, values built here
+/// decode byte-for-byte into the deployed wasm's own `Signer` / `Signatures`
+/// types. This is what lets `--realauth` deploy the real mainnet wasm (via its
+/// Ed25519 signer branch) and drive its genuine `__check_auth` — instead of
+/// bouncing off `deploy-failed` because the generic synth path cannot build a
+/// `Signer` enum.
+mod passkey {
+    use soroban_sdk::{contracttype, Address, Bytes, BytesN, Map, Vec};
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub struct SignerExpiration(pub Option<u32>);
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub struct SignerLimits(pub Option<Map<Address, Option<Vec<SignerKey>>>>);
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub struct Secp256r1Signature {
+        pub authenticator_data: Bytes,
+        pub client_data_json: Bytes,
+        pub signature: BytesN<64>,
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub struct Signatures(pub Map<SignerKey, Signature>);
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum SignerStorage {
+        Persistent,
+        Temporary,
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum Signer {
+        Policy(Address, SignerExpiration, SignerLimits, SignerStorage),
+        Ed25519(BytesN<32>, SignerExpiration, SignerLimits, SignerStorage),
+        Secp256r1(Bytes, BytesN<65>, SignerExpiration, SignerLimits, SignerStorage),
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum SignerKey {
+        Policy(Address),
+        Ed25519(BytesN<32>),
+        Secp256r1(Bytes),
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum Signature {
+        Policy,
+        Ed25519(BytesN<64>),
+        Secp256r1(Secp256r1Signature),
+    }
+}
 
 fn synth(env: &Env, t: &str, attacker: Option<&Address>) -> Option<Val> {
     if t == "address" {
@@ -276,8 +341,677 @@ fn probe_upgrade(
     }
 }
 
+/// Deploy a smart-account wasm for the check_auth prover. Smart accounts
+/// commonly take their initial signer in the constructor. We handle the shapes
+/// that matter: no ctor, a single 32-byte ed25519 pubkey, a single 65-byte
+/// secp256r1 (passkey) pubkey, or a single admin Address. Unknown shapes fall
+/// back to the generic synth path.
+fn checkauth_deploy(env: &Env, wasm: &[u8], ctor_csv: &str) -> Option<Address> {
+    let wasm_owned = wasm.to_vec();
+    let types = csv_types(ctor_csv);
+    if types.is_empty() {
+        let w = wasm_owned.clone();
+        return catch_unwind(AssertUnwindSafe(move || env.register(w.as_slice(), ()))).ok();
+    }
+    if types.len() == 1 {
+        let t = types[0].as_str();
+        let w = wasm_owned.clone();
+        let res = catch_unwind(AssertUnwindSafe(move || match t {
+            "bytes_n:32" => {
+                let pk = BytesN::from_array(env, &[0u8; 32]);
+                env.register(w.as_slice(), (pk,))
+            }
+            "bytes_n:65" => {
+                let pk = BytesN::from_array(env, &[0u8; 65]);
+                env.register(w.as_slice(), (pk,))
+            }
+            "address" => {
+                let a = Address::generate(env);
+                env.register(w.as_slice(), (a,))
+            }
+            _ => panic!("unsupported ctor type"),
+        }));
+        if let Ok(cid) = res {
+            return Some(cid);
+        }
+    }
+    // Fallback: generic synth (may or may not satisfy the constructor).
+    try_deploy(env, wasm, &types)
+}
+
+/// The check_auth prover. Deploys a `__check_auth`-exporting wasm and drives its
+/// authorization logic directly via `try_invoke_contract_check_auth` — with NO
+/// `mock_all_auths`, so the real `__check_auth` runs. Each hypothesis is a
+/// signature that ANY correct account must reject (unauthenticated, forged, or
+/// type-confused). A hypothesis that returns Ok(()) is an authorization bypass:
+/// the account approved a request that carried no valid signature. Because a
+/// correct account rejects every hypothesis, a clean run has zero false
+/// positives by construction (proven by the good_account fixture).
+fn probe_checkauth(wasm: &[u8], ctor_csv: &str) -> (String, Vec<(String, String, bool, String)>) {
+    let env = Env::default();
+    let cid = match checkauth_deploy(&env, wasm, ctor_csv) {
+        Some(c) => c,
+        None => {
+            return (
+                "deploy-failed".into(),
+                std::vec![(
+                    "-".into(),
+                    "-".into(),
+                    false,
+                    "could not deploy (constructor shape unsupported or trapped)".into(),
+                )],
+            );
+        }
+    };
+
+    // A fixed, non-zero signature payload (the message the account must have
+    // authorized). Its exact value is irrelevant to the bypass test: every
+    // hypothesis is a signature no honest signer produced for it.
+    let mut pbuf = [0u8; 32];
+    for (i, b) in pbuf.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_add(1);
+    }
+    let payload: BytesN<32> = BytesN::from_array(&env, &pbuf);
+
+    // The authorization the account is asked to grant: a `transfer` on itself.
+    let realistic_ctx: SVec<Context> = {
+        let mut v = SVec::new(&env);
+        v.push_back(Context::Contract(ContractContext {
+            contract: cid.clone(),
+            fn_name: symbol_short!("transfer"),
+            args: SVec::new(&env),
+        }));
+        v
+    };
+    let empty_ctx: SVec<Context> = SVec::new(&env);
+
+    // Signature hypotheses: each is something no honest signer over `payload`
+    // would ever produce. A correct account rejects all of them.
+    let hypotheses: Vec<(&str, Val)> = std::vec![
+        ("void", ().into_val(&env)),
+        ("empty-bytes", Bytes::new(&env).into_val(&env)),
+        ("zero-64", BytesN::from_array(&env, &[0u8; 64]).into_val(&env)),
+        ("garbage-64", BytesN::from_array(&env, &[0xABu8; 64]).into_val(&env)),
+        ("int-0", 0_i32.into_val(&env)),
+    ];
+
+    let mut records: Vec<(String, String, bool, String)> = Vec::new();
+    let mut any_bypass = false;
+
+    for (ctx_name, ctx) in [("transfer-ctx", &realistic_ctx), ("empty-ctx", &empty_ctx)] {
+        for (h_name, sig) in &hypotheses {
+            let sig = *sig;
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                env.try_invoke_contract_check_auth::<soroban_sdk::InvokeError>(
+                    &cid, &payload, sig, ctx,
+                )
+            }));
+            let (bypass, detail) = match res {
+                Ok(Ok(())) => (
+                    true,
+                    "__check_auth returned Ok for an unauthenticated/forged signature — BYPASS".to_string(),
+                ),
+                Ok(Err(_)) => (false, "rejected (auth failed) — correct".to_string()),
+                Err(_) => (false, "trapped (auth failed) — correct".to_string()),
+            };
+            if bypass {
+                any_bypass = true;
+            }
+            records.push((h_name.to_string(), ctx_name.to_string(), bypass, detail));
+        }
+    }
+
+    let verdict = if any_bypass { "auth-bypass".to_string() } else { "held".to_string() };
+    (verdict, records)
+}
+
+/// The signature-binding (cross-payload replay) prover. This is the passkey
+/// class: the target verifies a REAL signature — so `--checkauth`'s forgery
+/// battery finds nothing — but may fail to bind that signature to the payload it
+/// is actually authorizing. We hold the key here (it is our own fixture / any
+/// account whose signer we control for the test), so we can do what `--checkauth`
+/// cannot: produce ONE genuinely valid signature and then check two things a
+/// forgery battery never can — (1) the positive path (a valid signature IS
+/// accepted, closing that honest-limit) and (2) whether that same valid pair is
+/// accepted for a DIFFERENT payload, which is the bypass.
+///
+/// Signature ABI probed: a 96-byte `msg[0..32] || sig[32..96]` blob (the
+/// `unbound_account`/`bound_account` shape). A `held` verdict here means the
+/// account bound the signature to the payload; `replay-bypass` means a valid
+/// signature for payload A authorized payload B.
+fn probe_replay(wasm: &[u8], ctor_csv: &str) -> (String, Vec<(String, bool, String)>) {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    // Deterministic keypair (no RNG — reproducible across runs).
+    let seed: [u8; 32] = [7u8; 32];
+    let sk = SigningKey::from_bytes(&seed);
+    let pk_bytes: [u8; 32] = sk.verifying_key().to_bytes();
+
+    let env = Env::default();
+
+    // Deploy with OUR pubkey as the signer. Only the single-`BytesN<32>`
+    // constructor shape is meaningful for this prover; anything else is skipped.
+    let types = csv_types(ctor_csv);
+    let cid = {
+        let w = wasm.to_vec();
+        let pk = BytesN::from_array(&env, &pk_bytes);
+        let env2 = env.clone();
+        let res = catch_unwind(AssertUnwindSafe(move || {
+            if types.len() == 1 && types[0] == "bytes_n:32" {
+                env2.register(w.as_slice(), (pk,))
+            } else {
+                panic!("replay prover requires a single bytes_n:32 (ed25519 signer) constructor");
+            }
+        }));
+        match res {
+            Ok(c) => c,
+            Err(_) => {
+                return (
+                    "deploy-failed".into(),
+                    std::vec![(
+                        "-".into(),
+                        false,
+                        "could not deploy with our signer (needs a single bytes_n:32 constructor)".into(),
+                    )],
+                );
+            }
+        }
+    };
+
+    let payload_a: [u8; 32] = [0x11; 32];
+    let mut payload_b = [0x22u8; 32];
+    payload_b[0] = 0x23; // distinct from A
+
+    // A genuinely valid pair over payload A.
+    let sig_a: [u8; 64] = sk.sign(&payload_a).to_bytes();
+    let mut blob = [0u8; 96];
+    blob[0..32].copy_from_slice(&payload_a);
+    blob[32..96].copy_from_slice(&sig_a);
+
+    let ctx: SVec<Context> = {
+        let mut v = SVec::new(&env);
+        v.push_back(Context::Contract(ContractContext {
+            contract: cid.clone(),
+            fn_name: symbol_short!("transfer"),
+            args: SVec::new(&env),
+        }));
+        v
+    };
+
+    let call = |payload_bytes: &[u8; 32], sig_val: Val| -> Result<(), ()> {
+        let p: BytesN<32> = BytesN::from_array(&env, payload_bytes);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            env.try_invoke_contract_check_auth::<soroban_sdk::InvokeError>(
+                &cid, &p, sig_val, &ctx,
+            )
+        }));
+        match r {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(()),
+        }
+    };
+
+    let blob_val = BytesN::from_array(&env, &blob).into_val(&env);
+    let mut records: Vec<(String, bool, String)> = Vec::new();
+
+    // (1) Positive path: the valid pair over A must be accepted for payload A.
+    let positive_ok = call(&payload_a, blob_val).is_ok();
+    records.push((
+        "positive-path".into(),
+        false,
+        if positive_ok {
+            "valid signature accepted for its own payload — baseline established".into()
+        } else {
+            "valid signature REJECTED for its own payload — ABI/signer mismatch, replay test inconclusive".into()
+        },
+    ));
+
+    // Control: a valid-length but wrong signature over A must be rejected (proves
+    // the account really verifies, so a later Ok is meaningful and not a stub).
+    let mut forged = [0u8; 96];
+    forged[0..32].copy_from_slice(&payload_a);
+    forged[32..96].copy_from_slice(&[0xABu8; 64]);
+    let forged_val = BytesN::from_array(&env, &forged).into_val(&env);
+    let forgery_rejected = call(&payload_a, forged_val).is_err();
+    records.push((
+        "forgery-control".into(),
+        false,
+        if forgery_rejected {
+            "forged signature over A rejected — account really verifies".into()
+        } else {
+            "forged signature over A ACCEPTED — account does not verify (see --checkauth)".into()
+        },
+    ));
+
+    // (2) The bypass: the SAME valid pair, submitted for a different payload B.
+    let blob_val2 = BytesN::from_array(&env, &blob).into_val(&env);
+    let replay_ok = call(&payload_b, blob_val2).is_ok();
+    records.push((
+        "cross-payload-replay".into(),
+        replay_ok,
+        if replay_ok {
+            "valid signature for payload A authorized DIFFERENT payload B — signature not bound to payload — BYPASS".into()
+        } else {
+            "valid pair for A rejected for B — signature bound to payload — correct".into()
+        },
+    ));
+
+    let verdict = if !positive_ok {
+        "inconclusive"
+    } else if replay_ok {
+        "replay-bypass"
+    } else {
+        "held"
+    };
+    (verdict.to_string(), records)
+}
+
+/// Real-target auth prover. Unlike `--replay` (which only understands the
+/// synthetic `unbound_account` 96-byte blob ABI), this deploys the ACTUAL
+/// passkey-kit smart-wallet wasm using its Ed25519 signer branch — a signer
+/// whose key we hold — and drives the genuine `__check_auth` with a real
+/// ed25519 signature wrapped in the target's own `Signatures(Map<SignerKey,
+/// Signature>)` type. No mock. Three probes on the live authorization logic:
+///   (1) positive: a genuine signature over payload A is accepted for A;
+///   (2) forgery-control: a garbage 64-byte "signature" over A is rejected
+///       (proves the account really verifies — a later Ok is meaningful);
+///   (3) cross-payload replay: the genuine A-signature is presented for a
+///       DIFFERENT payload B — accepted = binding bug, rejected = held.
+/// Verdict `held` here is a real result against the real wasm, not a fixture.
+fn probe_realauth(wasm: &[u8]) -> (String, Vec<(String, bool, String)>) {
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use passkey::{Signature, Signatures, Signer, SignerExpiration, SignerKey, SignerLimits, SignerStorage};
+    use soroban_sdk::Map;
+
+    let env = Env::default();
+
+    // A signer we control.
+    let seed: [u8; 32] = [7u8; 32];
+    let sk = SigningKey::from_bytes(&seed);
+    let pk_bytes: [u8; 32] = sk.verifying_key().to_bytes();
+    let pk: BytesN<32> = BytesN::from_array(&env, &pk_bytes);
+
+    // Deploy the REAL wasm with our Ed25519 signer, no limits, no expiration.
+    let signer = Signer::Ed25519(
+        pk.clone(),
+        SignerExpiration(None),
+        SignerLimits(None),
+        SignerStorage::Persistent,
+    );
+    let w = wasm.to_vec();
+    let env2 = env.clone();
+    let deploy = catch_unwind(AssertUnwindSafe(move || env2.register(w.as_slice(), (signer,))));
+    let cid = match deploy {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                "deploy-failed".into(),
+                std::vec![("-".into(), false, "could not deploy real wasm with Ed25519 signer".into())],
+            );
+        }
+    };
+
+    let ctx: SVec<Context> = {
+        let mut v = SVec::new(&env);
+        v.push_back(Context::Contract(ContractContext {
+            contract: cid.clone(),
+            fn_name: symbol_short!("transfer"),
+            args: SVec::new(&env),
+        }));
+        v
+    };
+
+    // Build a `Signatures` map carrying one Ed25519 signature for our key.
+    let make_sigs = |sig64: [u8; 64]| -> Val {
+        let mut m: Map<SignerKey, Signature> = Map::new(&env);
+        m.set(
+            SignerKey::Ed25519(pk.clone()),
+            Signature::Ed25519(BytesN::from_array(&env, &sig64)),
+        );
+        Signatures(m).into_val(&env)
+    };
+
+    let call = |payload_bytes: &[u8; 32], sig_val: Val| -> Result<(), ()> {
+        let p: BytesN<32> = BytesN::from_array(&env, payload_bytes);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            env.try_invoke_contract_check_auth::<soroban_sdk::InvokeError>(&cid, &p, sig_val, &ctx)
+        }));
+        match r {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(()),
+        }
+    };
+
+    let payload_a: [u8; 32] = [0x11; 32];
+    let mut payload_b = [0x22u8; 32];
+    payload_b[0] = 0x23;
+
+    let sig_a: [u8; 64] = sk.sign(&payload_a).to_bytes();
+
+    let mut records: Vec<(String, bool, String)> = Vec::new();
+
+    // (1) positive path
+    let positive_ok = call(&payload_a, make_sigs(sig_a)).is_ok();
+    records.push((
+        "positive-path".into(),
+        false,
+        if positive_ok {
+            "genuine ed25519 signature accepted for its own payload — real __check_auth reached and baseline established".into()
+        } else {
+            "genuine signature REJECTED for its own payload — deploy/ABI mismatch, test inconclusive".into()
+        },
+    ));
+
+    // (2) forgery control
+    let forgery_rejected = call(&payload_a, make_sigs([0xABu8; 64])).is_err();
+    records.push((
+        "forgery-control".into(),
+        false,
+        if forgery_rejected {
+            "forged signature over A rejected — real account verifies cryptographically".into()
+        } else {
+            "forged signature over A ACCEPTED — account does not verify".into()
+        },
+    ));
+
+    // (3) cross-payload replay
+    let replay_ok = call(&payload_b, make_sigs(sig_a)).is_ok();
+    records.push((
+        "cross-payload-replay".into(),
+        replay_ok,
+        if replay_ok {
+            "genuine signature for payload A authorized DIFFERENT payload B — signature not bound — BYPASS".into()
+        } else {
+            "genuine A-signature rejected for B — signature bound to payload — held".into()
+        },
+    ));
+
+    let verdict = if !positive_ok {
+        "inconclusive"
+    } else if replay_ok {
+        "replay-bypass"
+    } else {
+        "held"
+    };
+    (verdict.to_string(), records)
+}
+
+/// Real-target auth prover for the SECP256R1 / WebAuthn (passkey) signer branch.
+/// This is the branch that actually matters: `--realauth` (ed25519) proves the
+/// machinery lands, but a correct `ed25519_verify(pk, payload, sig)` binds the
+/// signature to the payload by construction, so its cross-payload probe is
+/// nearly vacuous. The real binding bug (swig-wallet #143) lives here — a wallet
+/// that verifies the ECDSA assertion but never checks the signed
+/// `clientDataJSON.challenge` equals the payload it is authorizing.
+///
+/// We hold a p256 key, deploy the target via its `Signer::Secp256r1` branch, and
+/// forge a genuine WebAuthn assertion (authenticatorData + clientDataJSON +
+/// ECDSA-secp256r1 signature over `sha256(ad || sha256(cdj))`). Three probes:
+///   (1) positive: a genuine assertion whose challenge encodes payload A is
+///       accepted for A — establishes the real `__check_auth` was reached;
+///   (2) forgery-control: the same assertion with a garbage signature is
+///       rejected — proves the account cryptographically verifies;
+///   (3) cross-payload replay: the genuine A-assertion (challenge still encodes
+///       A) is presented to authorize a DIFFERENT payload B. A wallet that binds
+///       the challenge rejects it; one that does not authorizes B — BYPASS.
+fn probe_realauth_p256(wasm: &[u8]) -> (String, Vec<(String, bool, String)>) {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature as P256Sig, SigningKey};
+    use passkey::{
+        Secp256r1Signature, Signature, Signatures, Signer, SignerExpiration, SignerKey,
+        SignerLimits, SignerStorage,
+    };
+    use sha2::{Digest, Sha256};
+    use soroban_sdk::Map;
+
+    let env = Env::default();
+
+    // A p256 signer we control (fixed nonzero scalar < curve order).
+    let scalar = [0x11u8; 32];
+    let sk = SigningKey::from_slice(&scalar).expect("valid p256 scalar");
+    let vk = sk.verifying_key();
+    let ep = vk.to_encoded_point(false); // uncompressed 0x04 || X || Y
+    let pk65: BytesN<65> = BytesN::from_array(&env, ep.as_bytes().try_into().expect("65-byte key"));
+
+    let key_id = Bytes::from_slice(&env, b"kid1");
+    let signer = Signer::Secp256r1(
+        key_id.clone(),
+        pk65.clone(),
+        SignerExpiration(None),
+        SignerLimits(None),
+        SignerStorage::Persistent,
+    );
+    let w = wasm.to_vec();
+    let env2 = env.clone();
+    let deploy = catch_unwind(AssertUnwindSafe(move || env2.register(w.as_slice(), (signer,))));
+    let cid = match deploy {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                "deploy-failed".into(),
+                std::vec![("-".into(), false, "could not deploy real wasm with Secp256r1 signer".into())],
+            );
+        }
+    };
+
+    let ctx: SVec<Context> = {
+        let mut v = SVec::new(&env);
+        v.push_back(Context::Contract(ContractContext {
+            contract: cid.clone(),
+            fn_name: symbol_short!("transfer"),
+            args: SVec::new(&env),
+        }));
+        v
+    };
+
+    // authenticatorData: 32-byte rpIdHash || flags(UP|UV=0x05) || 4-byte counter.
+    let mut ad = [0u8; 37];
+    ad[32] = 0x05;
+    ad[36] = 0x01;
+    let ad_bytes = Bytes::from_array(&env, &ad);
+
+    // Build a genuine WebAuthn assertion whose challenge encodes `payload`.
+    let make_assertion = |payload: &[u8; 32]| -> (Bytes, [u8; 64]) {
+        let chal = URL_SAFE_NO_PAD.encode(payload);
+        let cdj = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"https://x\",\"crossOrigin\":false}}",
+            chal
+        );
+        let cdj_bytes = Bytes::from_slice(&env, cdj.as_bytes());
+        // digest = sha256(authenticatorData || sha256(clientDataJSON))
+        let cdj_hash = Sha256::digest(cdj.as_bytes());
+        let mut pre = ad.to_vec();
+        pre.extend_from_slice(&cdj_hash);
+        let digest = Sha256::digest(&pre);
+        let sig: P256Sig = sk.sign_prehash(&digest).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig); // low-S, required by host
+        let sig_arr: [u8; 64] = sig.to_bytes().into();
+        (cdj_bytes, sig_arr)
+    };
+
+    // Wrap an assertion in the target's own Signatures(Map<SignerKey,Signature>).
+    let make_sigs = |cdj: &Bytes, sig64: [u8; 64]| -> Val {
+        let mut m: Map<SignerKey, Signature> = Map::new(&env);
+        m.set(
+            SignerKey::Secp256r1(key_id.clone()),
+            Signature::Secp256r1(Secp256r1Signature {
+                authenticator_data: ad_bytes.clone(),
+                client_data_json: cdj.clone(),
+                signature: BytesN::from_array(&env, &sig64),
+            }),
+        );
+        Signatures(m).into_val(&env)
+    };
+
+    let call = |payload: &[u8; 32], sig_val: Val| -> Result<(), ()> {
+        let p: BytesN<32> = BytesN::from_array(&env, payload);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            env.try_invoke_contract_check_auth::<soroban_sdk::InvokeError>(&cid, &p, sig_val, &ctx)
+        }));
+        match r {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(()),
+        }
+    };
+
+    let payload_a: [u8; 32] = [0x11; 32];
+    let mut payload_b = [0x22u8; 32];
+    payload_b[0] = 0x23;
+
+    let (cdj_a, sig_a) = make_assertion(&payload_a);
+
+    let mut records: Vec<(String, bool, String)> = Vec::new();
+
+    // (1) positive path
+    let positive_ok = call(&payload_a, make_sigs(&cdj_a, sig_a)).is_ok();
+    records.push((
+        "positive-path".into(),
+        false,
+        if positive_ok {
+            "genuine secp256r1 WebAuthn assertion accepted for its own payload — real __check_auth reached, baseline established".into()
+        } else {
+            "genuine assertion REJECTED for its own payload — deploy/ABI/digest mismatch, test inconclusive".into()
+        },
+    ));
+
+    // (2) forgery control
+    let forgery_rejected = call(&payload_a, make_sigs(&cdj_a, [0xABu8; 64])).is_err();
+    records.push((
+        "forgery-control".into(),
+        false,
+        if forgery_rejected {
+            "garbage signature rejected — real account verifies the ECDSA assertion".into()
+        } else {
+            "garbage signature ACCEPTED — account does not verify (see --checkauth)".into()
+        },
+    ));
+
+    // (3) cross-payload replay: A's genuine assertion presented for payload B.
+    let replay_ok = call(&payload_b, make_sigs(&cdj_a, sig_a)).is_ok();
+    records.push((
+        "cross-payload-replay".into(),
+        replay_ok,
+        if replay_ok {
+            "assertion whose challenge encodes payload A authorized DIFFERENT payload B — challenge not bound — BYPASS".into()
+        } else {
+            "A-assertion rejected for B — challenge bound to payload — held".into()
+        },
+    ));
+
+    let verdict = if !positive_ok {
+        "inconclusive"
+    } else if replay_ok {
+        "replay-bypass"
+    } else {
+        "held"
+    };
+    (verdict.to_string(), records)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(|s| s.as_str()) == Some("--realauth-p256") {
+        // --realauth-p256 <wasm> <out_json>
+        let wasm = std::fs::read(&args[1]).expect("read wasm");
+        let out_path = &args[2];
+        let (verdict, records) = probe_realauth_p256(&wasm);
+        let recs: Vec<String> = records
+            .iter()
+            .map(|(h, b, d)| format!("{{\"probe\":\"{}\",\"bypass\":{},\"detail\":\"{}\"}}", esc(h), b, esc(d)))
+            .collect();
+        let bypasses = records.iter().filter(|(_, b, _)| *b).count();
+        std::fs::write(
+            out_path,
+            format!(
+                "{{\"mode\":\"realauth-p256\",\"verdict\":\"{}\",\"bypasses\":{},\"probes\":[{}]}}",
+                verdict, bypasses, recs.join(",")
+            ),
+        )
+        .expect("write out");
+        println!("[harness --realauth-p256] verdict={} bypasses={}/{}", verdict, bypasses, records.len());
+        return;
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("--realauth") {
+        // --realauth <wasm> <out_json>
+        let wasm = std::fs::read(&args[1]).expect("read wasm");
+        let out_path = &args[2];
+        let (verdict, records) = probe_realauth(&wasm);
+        let recs: Vec<String> = records
+            .iter()
+            .map(|(h, b, d)| format!("{{\"probe\":\"{}\",\"bypass\":{},\"detail\":\"{}\"}}", esc(h), b, esc(d)))
+            .collect();
+        let bypasses = records.iter().filter(|(_, b, _)| *b).count();
+        std::fs::write(
+            out_path,
+            format!(
+                "{{\"mode\":\"realauth\",\"verdict\":\"{}\",\"bypasses\":{},\"probes\":[{}]}}",
+                verdict, bypasses, recs.join(",")
+            ),
+        )
+        .expect("write out");
+        println!("[harness --realauth] verdict={} bypasses={}/{}", verdict, bypasses, records.len());
+        return;
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("--replay") {
+        // --replay <wasm> <out_json> <ctor_csv>
+        let wasm = std::fs::read(&args[1]).expect("read wasm");
+        let out_path = &args[2];
+        let ctor_csv = args.get(3).map(|s| s.as_str()).unwrap_or("");
+        let (verdict, records) = probe_replay(&wasm, ctor_csv);
+        let recs: Vec<String> = records
+            .iter()
+            .map(|(h, b, d)| {
+                format!(
+                    "{{\"probe\":\"{}\",\"bypass\":{},\"detail\":\"{}\"}}",
+                    esc(h), b, esc(d)
+                )
+            })
+            .collect();
+        let bypasses = records.iter().filter(|(_, b, _)| *b).count();
+        std::fs::write(
+            out_path,
+            format!(
+                "{{\"mode\":\"replay\",\"verdict\":\"{}\",\"bypasses\":{},\"probes\":[{}]}}",
+                verdict, bypasses, recs.join(",")
+            ),
+        )
+        .expect("write out");
+        println!("[harness --replay] verdict={} bypasses={}/{}", verdict, bypasses, records.len());
+        return;
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("--checkauth") {
+        // --checkauth <wasm> <out_json> <ctor_csv>
+        let wasm = std::fs::read(&args[1]).expect("read wasm");
+        let out_path = &args[2];
+        let ctor_csv = args.get(3).map(|s| s.as_str()).unwrap_or("");
+        let (verdict, records) = probe_checkauth(&wasm, ctor_csv);
+        let recs: Vec<String> = records
+            .iter()
+            .map(|(h, c, b, d)| {
+                format!(
+                    "{{\"hypothesis\":\"{}\",\"context\":\"{}\",\"bypass\":{},\"detail\":\"{}\"}}",
+                    esc(h), esc(c), b, esc(d)
+                )
+            })
+            .collect();
+        let bypasses = records.iter().filter(|(_, _, b, _)| *b).count();
+        std::fs::write(
+            out_path,
+            format!(
+                "{{\"mode\":\"checkauth\",\"verdict\":\"{}\",\"bypasses\":{},\"probes\":[{}]}}",
+                verdict,
+                bypasses,
+                recs.join(",")
+            ),
+        )
+        .expect("write out");
+        println!("[harness --checkauth] verdict={} bypasses={}/{}", verdict, bypasses, records.len());
+        return;
+    }
 
     if args.first().map(|s| s.as_str()) == Some("--upgrade") {
         // --upgrade <target> <attacker> <out> <ctor_csv> <upgrade_fn:types>
