@@ -908,8 +908,128 @@ fn probe_realauth_p256(wasm: &[u8]) -> (String, Vec<(String, bool, String)>) {
     (verdict.to_string(), records)
 }
 
+/// Unrestricted-`transfer_from` prover: the third-party allowance-drain class
+/// (Scout's `unrestricted-transfer-from`, but as an EXECUTED value loss, not a
+/// static pattern). sorohunter's economic detectors watch the contract's and the
+/// attacker's balances; this class moves a VICTIM's approved balance, which none
+/// of them watch — the exact gap. Here the prover sets up the victim state and
+/// proves it: mint a victim, have the victim grant the contract a standing
+/// allowance (a legitimate one-time approve), then call the target fn under EMPTY
+/// auth (no victim signature). If the victim's real token balance drops, the
+/// contract spent someone else's allowance on an unauthenticated call — an
+/// executed `transfer_from` bypass. A contract that guards with `from.require_auth()`
+/// reverts under empty auth and is `held`.
+///
+/// v1 convention: the target has a single-`Address` (token) constructor and a fn
+/// `<name>(from: Address, amount: i128)`. Other shapes are roadmap.
+fn probe_allowance(wasm: &[u8], fn_name: &str) -> (String, Vec<(String, bool, String)>) {
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
+
+    let env = Env::default();
+    env.mock_all_auths(); // setup phase: mint + approve run with authorization
+
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = sac.address();
+
+    // Deploy the target with its (token) constructor.
+    let w = wasm.to_vec();
+    let token_for_deploy = token.clone();
+    let env2 = env.clone();
+    let target = match catch_unwind(AssertUnwindSafe(move || {
+        env2.register(w.as_slice(), (token_for_deploy,))
+    })) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                "deploy-failed".into(),
+                std::vec![("-".into(), false, "could not deploy target with a single-Address (token) constructor".into())],
+            );
+        }
+    };
+
+    let victim = Address::generate(&env);
+    let amount: i128 = 1000;
+    StellarAssetClient::new(&env, &token).mint(&victim, &amount);
+    // The victim legitimately approves the contract as a spender (one-time).
+    let exp = env.ledger().sequence() + 10_000;
+    TokenClient::new(&env, &token).approve(&victim, &target, &amount, &exp);
+
+    let before = TokenClient::new(&env, &token).balance(&victim);
+
+    // PROBE: invoke the fn under EMPTY auth — the victim signs nothing now.
+    env.set_auths(&[]);
+    let mut call_args: SVec<Val> = SVec::new(&env);
+    call_args.push_back(victim.clone().into_val(&env)); // from = victim
+    call_args.push_back(amount.into_val(&env)); // amount = full allowance
+    let name = Symbol::new(&env, fn_name);
+    let tgt = target.clone();
+    let env3 = env.clone();
+    let reverted = catch_unwind(AssertUnwindSafe(move || {
+        env3.invoke_contract::<Val>(&tgt, &name, call_args);
+    }))
+    .is_err();
+
+    let after = TokenClient::new(&env, &token).balance(&victim);
+    let drained = after < before;
+
+    let mut records: Vec<(String, bool, String)> = Vec::new();
+    records.push((
+        "victim-approved".into(),
+        false,
+        format!(
+            "victim granted the contract a standing allowance of {} and holds {} before the probe",
+            amount, before
+        ),
+    ));
+    records.push((
+        "empty-auth-pull".into(),
+        drained,
+        if drained {
+            format!(
+                "a call to `{}` under EMPTY auth moved {} of the victim's tokens (balance {}->{}) with NO victim signature — unauthorized third-party transfer_from",
+                fn_name,
+                before - after,
+                before,
+                after
+            )
+        } else if reverted {
+            format!("`{}` reverted under empty auth (the victim's require_auth is unsatisfied) — held", fn_name)
+        } else {
+            format!("`{}` ran under empty auth but the victim's balance is unchanged ({}) — no third-party drain", fn_name, after)
+        },
+    ));
+
+    let verdict = if drained { "allowance-drain" } else { "held" };
+    (verdict.to_string(), records)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(|s| s.as_str()) == Some("--allowance") {
+        // --allowance <wasm> <out_json> <fn:types>
+        let wasm = std::fs::read(&args[1]).expect("read wasm");
+        let out_path = &args[2];
+        let spec = args.get(3).map(|s| s.as_str()).unwrap_or("pull");
+        let (fn_name, _types) = split_spec(spec);
+        let (verdict, records) = probe_allowance(&wasm, &fn_name);
+        let recs: Vec<String> = records
+            .iter()
+            .map(|(h, b, d)| format!("{{\"probe\":\"{}\",\"bypass\":{},\"detail\":\"{}\"}}", esc(h), b, esc(d)))
+            .collect();
+        let bypasses = records.iter().filter(|(_, b, _)| *b).count();
+        std::fs::write(
+            out_path,
+            format!(
+                "{{\"mode\":\"allowance\",\"verdict\":\"{}\",\"bypasses\":{},\"probes\":[{}]}}",
+                verdict, bypasses, recs.join(",")
+            ),
+        )
+        .expect("write out");
+        println!("[harness --allowance] verdict={} bypasses={}/{}", verdict, bypasses, records.len());
+        return;
+    }
 
     if args.first().map(|s| s.as_str()) == Some("--realauth-p256") {
         // --realauth-p256 <wasm> <out_json>
