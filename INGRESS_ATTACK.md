@@ -303,11 +303,11 @@ both incumbent disciplines. The map is load-bearing, not a poster. Fix direction
 + a sanity bound + rejecting `stale` at order creation; and settlement reading
 `payment` only from a pinned/authenticated Horizon.
 
-## Why this is the funding play
+## Why this matters
 
 The Soroban map made sorohunter "the adversary taxonomy + the fork-validated
 detector layer." The ingress map extends the claim to the part **nobody owns**:
 the seam between web2 and web3, visible to neither web3 audit tooling (which stops
 at the contract) nor web2 appsec (which does not know the impact is on-chain and
-irreversible). The public good is the two-map kill chain; the moat is that
-mapping it credibly requires one person who holds both threat models at once.
+irreversible). The two-map kill chain is the deliverable; the moat is that mapping
+it credibly requires one person who holds both threat models at once.
