@@ -153,9 +153,19 @@ fn probe_chain(wasm: &[u8], ctor: &[String], foothold: &str, f_types: &[String],
     let cid = match try_deploy(&env, wasm, ctor) { Some(c) => c, None => return ("deploy-failed".into(), "could not deploy".into()) };
     let attacker = Address::generate(&env);
     let f_args = match build_args(&env, f_types, Some(&attacker)) { Some(a) => a, None => return ("skipped".into(), "unsynthesizable foothold arg".into()) };
+    // If the foothold is a one-time initializer, prime it once under mock to
+    // simulate the real deploy-time init. On the live contract initialize has
+    // already run; a "chain" that only works because our fresh fork let
+    // initialize run again is a fresh-deploy artifact, not a live finding — the
+    // same guard the single-fn path applies (is_init_name -> init-guarded).
+    if is_init_name(foothold) {
+        if let Some(prime) = build_args(&env, f_types, None) {
+            let _ = env.try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, foothold), prime);
+        }
+    }
     env.set_auths(&[]);
     if env.try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, foothold), f_args).is_err() {
-        return ("no-foothold".into(), "foothold aborts under empty auth (setter is gated)".into());
+        return ("no-foothold".into(), "foothold aborts under empty auth (initializer already ran / setter is gated) — fresh-deploy artifact filtered".into());
     }
     let t_args = match build_args(&env, t_types, Some(&attacker)) { Some(a) => a, None => return ("skipped".into(), "unsynthesizable target arg".into()) };
     let before = env.events().all().events().len() as i64;
