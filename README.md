@@ -458,7 +458,7 @@ good for the ecosystem, ready for the value that follows.
 - [`SOROBAN_LANGUAGE_STUDY.md`](SOROBAN_LANGUAGE_STUDY.md) — host deconstruction
 - [`oracles/README.md`](oracles/README.md) — the algebraic ground-truth oracles
 - [`SPEC.md`](SPEC.md) — design spec
-- [`SCF_PUBLIC_GOODS.md`](SCF_PUBLIC_GOODS.md) — funding / positioning
+
 
 ---
 
