@@ -1004,6 +1004,81 @@ fn probe_allowance(wasm: &[u8], fn_name: &str) -> (String, Vec<(String, bool, St
     (verdict.to_string(), records)
 }
 
+/// Auth-arg scope-mismatch prover (TA-04). A payment fn that authorizes the payer
+/// with `require_auth_for_args` scoped too narrowly (omitting the recipient /
+/// amount) lets one authorization be replayed to any recipient. The prover mocks
+/// an authorization for the payer scoped to ONLY the payer address, then calls
+/// `pay(payer, attacker, amount)`. If the attacker's balance moves, the narrow
+/// scope authorized a redirected payment — an executed scope-mismatch bypass. A
+/// contract that binds the full args (`require_auth`) reverts under that mock.
+///
+/// v1 convention: `pay(from: Address, to: Address, amount: i128)` +
+/// `mint(to, amount)` + `balance(id) -> i128`.
+fn probe_scope(wasm: &[u8]) -> (String, Vec<(String, bool, String)>) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let w = wasm.to_vec();
+    let env_a = env.clone();
+    let cid = match catch_unwind(AssertUnwindSafe(move || env_a.register(w.as_slice(), ()))) {
+        Ok(c) => c,
+        Err(_) => return ("deploy-failed".into(), std::vec![("-".into(), false, "deploy failed (expects no-arg constructor)".into())]),
+    };
+
+    let victim = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let amount: i128 = 500;
+
+    // seed the victim's balance (setup, freely authorized)
+    let mut margs: SVec<Val> = SVec::new(&env);
+    margs.push_back(victim.clone().into_val(&env));
+    margs.push_back(1000i128.into_val(&env));
+    if catch_unwind(AssertUnwindSafe(|| { env.invoke_contract::<Val>(&cid, &Symbol::new(&env, "mint"), margs); })).is_err() {
+        return ("inconclusive".into(), std::vec![("mint".into(), false, "no mint(Address,i128) — cannot set up the scope test".into())]);
+    }
+
+    // Authorization the payer produces, scoped to ONLY [victim] — the exact
+    // (buggy) scope a TA-04 contract asks for. It does NOT name the recipient.
+    let mut scope: SVec<Val> = SVec::new(&env);
+    scope.push_back(victim.clone().into_val(&env));
+    env.mock_auths(&[MockAuth {
+        address: &victim,
+        invoke: &MockAuthInvoke { contract: &cid, fn_name: "pay", args: scope.clone(), sub_invokes: &[] },
+    }]);
+
+    // Attacker redirects the payment to themselves under that narrow auth.
+    let mut pargs: SVec<Val> = SVec::new(&env);
+    pargs.push_back(victim.clone().into_val(&env));
+    pargs.push_back(attacker.clone().into_val(&env));
+    pargs.push_back(amount.into_val(&env));
+    let paid = catch_unwind(AssertUnwindSafe(|| { env.invoke_contract::<Val>(&cid, &Symbol::new(&env, "pay"), pargs); })).is_ok();
+
+    // Confirm value actually moved to the attacker (not just that the call ran).
+    env.mock_all_auths();
+    let mut bargs: SVec<Val> = SVec::new(&env);
+    bargs.push_back(attacker.clone().into_val(&env));
+    let atk_bal: i128 = env.invoke_contract(&cid, &Symbol::new(&env, "balance"), bargs);
+    let moved = paid && atk_bal >= amount;
+
+    let mut records: Vec<(String, bool, String)> = Vec::new();
+    records.push((
+        "narrow-auth".into(),
+        false,
+        "payer authorized scoped to [payer] only (recipient/amount omitted from the auth scope)".into(),
+    ));
+    records.push((
+        "redirect-under-scope".into(),
+        moved,
+        if moved {
+            format!("pay(payer, attacker, {}) executed under the [payer]-only auth — {} moved to an unnamed recipient; the authorization did not bind (to, amount)", amount, atk_bal)
+        } else {
+            "the redirected payment reverted — the authorization binds the full (from, to, amount), held".into()
+        },
+    ));
+    let verdict = if moved { "scope-mismatch" } else { "held" };
+    (verdict.to_string(), records)
+}
+
 /// Fee-on-transfer accounting prover (Coinspect Tricorn TRI-005 class). A vault
 /// that credits the `amount` argument instead of its measured balance delta
 /// over-credits against a deflationary token, going insolvent. Static linters
@@ -1085,6 +1160,28 @@ fn probe_feetoken(vault_wasm: &[u8], fee_token_wasm: &[u8]) -> (String, Vec<(Str
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(|s| s.as_str()) == Some("--scope") {
+        // --scope <wasm> <out_json>
+        let wasm = std::fs::read(&args[1]).expect("read wasm");
+        let out_path = &args[2];
+        let (verdict, records) = probe_scope(&wasm);
+        let recs: Vec<String> = records
+            .iter()
+            .map(|(h, b, d)| format!("{{\"probe\":\"{}\",\"bypass\":{},\"detail\":\"{}\"}}", esc(h), b, esc(d)))
+            .collect();
+        let bypasses = records.iter().filter(|(_, b, _)| *b).count();
+        std::fs::write(
+            out_path,
+            format!(
+                "{{\"mode\":\"scope\",\"verdict\":\"{}\",\"bypasses\":{},\"probes\":[{}]}}",
+                verdict, bypasses, recs.join(",")
+            ),
+        )
+        .expect("write out");
+        println!("[harness --scope] verdict={} bypasses={}/{}", verdict, bypasses, records.len());
+        return;
+    }
 
     if args.first().map(|s| s.as_str()) == Some("--feetoken") {
         // --feetoken <vault_wasm> <out_json> <fee_token_wasm>
