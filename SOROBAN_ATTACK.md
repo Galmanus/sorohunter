@@ -36,6 +36,7 @@ executed proof — a code invariant in the harness, not a promise.
 | TR-03 state/role map | TA-03 initializer re-entry | TE-03 oracle/config poison | | | TM-01 unchecked `i128` arithmetic | TZ-03 trusted-setup / VK misuse | OBJ-BRICK |
 | TR-04 dep & upgrade-hook discovery | TA-04 auth-arg scope mismatch | | | | | TZ-04 Fiat-Shamir / proof-replay | OBJ-SEIZE |
 | | **TA-05 caller-supplied-address trust** ✅ | | | | | | OBJ-CENSOR |
+| | **TA-06 unrestricted `transfer_from`** ✅ | | | | | | |
 
 ✅ = sorohunter ships a fork-validated detector today. All others: roadmap (mechanical) or manual (cryptographic/business-logic).
 
@@ -54,6 +55,7 @@ executed proof — a code invariant in the harness, not a promise.
 - **TA-02 unprotected admin setter** — `set_admin` / `transfer_ownership` / `add_allowlist` reachable under empty/weak auth. Fork-detectable. **sorohunter: SHIPPED** (`probe_hijack`, `hijack` verdict — injects the attacker under empty auth and reads the admin getter before/after; catches silent setters the event-delta `breach` probe misses; proven live on the `admin_capture` testnet fixture).
 - **TA-03 initializer re-entry** — un-guarded `initialize` / `__constructor` re-sets admin. Classic Soroban re-init. Fork-detectable. Roadmap.
 - **TA-04 auth-arg scope mismatch** — `require_auth` present but `require_auth_for_args` scope does not bind the sensitive args. Fork-detectable with arg-mutation. Roadmap.
+- **TA-06 unrestricted `transfer_from`** — contract calls `token.transfer_from(self, victim, ..., amount)` spending a victim's standing allowance without `victim.require_auth()`, so anyone can trigger the pull. The static linters flag this by pattern (CoinFabrik Scout's `unrestricted-transfer-from`) but cannot confirm exploitability; sorohunter's economic detectors (`drain`/`greed`) watch only the *contract's* and *attacker's* balances, so a third-party victim's loss slips past. *Detector (`--allowance`): mint a victim, have the victim grant the contract a standing allowance, then invoke the fn under EMPTY auth — a real balance drop on the victim with no victim signature is the executed proof. Validated on `unauth_pull` (drained 1000→0) vs `auth_pull` (`require_auth` reverts → held), 0 false positives.* **sorohunter: SHIPPED.**
 - **TA-05 caller-supplied-address trust** — contract acts on an address/token the attacker passes without binding auth to it. Anchor: prompt-injection-into-authorized-payment class (Bankr/Grok ~$150-180K, MCP router drain $500K — the agent *was* authorized). Fork-detectable. **sorohunter: SHIPPED** (`probe_redirect`, `redirect` verdict — decoupled authorizer/recipient injection: one scoped-auth caller, attacker as unbound recipient; orthogonal to `greed` by the self-pay guard; proven live on the `redirect_vault` testnet fixture).
 
 ### Privilege Escalation / Composition — the actual chain
