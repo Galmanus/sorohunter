@@ -1004,8 +1004,110 @@ fn probe_allowance(wasm: &[u8], fn_name: &str) -> (String, Vec<(String, bool, St
     (verdict.to_string(), records)
 }
 
+/// Fee-on-transfer accounting prover (Coinspect Tricorn TRI-005 class). A vault
+/// that credits the `amount` argument instead of its measured balance delta
+/// over-credits against a deflationary token, going insolvent. Static linters
+/// (Scout/OZ) do not catch this — it is a dynamic accounting invariant. The
+/// prover deploys a real fee-on-transfer token and the target vault, deposits
+/// through it, and compares the vault's internal credit to the tokens it actually
+/// holds. credit > real balance = over-credit = the bug.
+///
+/// v1 convention: target has a single-Address (token) constructor and a
+/// `deposit(from: Address, amount: i128)` + `credit(id: Address) -> i128`.
+fn probe_feetoken(vault_wasm: &[u8], fee_token_wasm: &[u8]) -> (String, Vec<(String, bool, String)>) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // fee-on-transfer token, 10% skim.
+    let ftw = fee_token_wasm.to_vec();
+    let env_a = env.clone();
+    let token = match catch_unwind(AssertUnwindSafe(move || env_a.register(ftw.as_slice(), (1000u32,)))) {
+        Ok(c) => c,
+        Err(_) => return ("deploy-failed".into(), std::vec![("-".into(), false, "fee_token deploy failed".into())]),
+    };
+    let vw = vault_wasm.to_vec();
+    let token_c = token.clone();
+    let env_b = env.clone();
+    let vault = match catch_unwind(AssertUnwindSafe(move || env_b.register(vw.as_slice(), (token_c,)))) {
+        Ok(c) => c,
+        Err(_) => return ("deploy-failed".into(), std::vec![("-".into(), false, "vault deploy failed (needs single-Address token constructor)".into())]),
+    };
+
+    let attacker = Address::generate(&env);
+    let amount: i128 = 1000;
+    // mint the attacker fee-token balance
+    let mut margs: SVec<Val> = SVec::new(&env);
+    margs.push_back(attacker.clone().into_val(&env));
+    margs.push_back(amount.into_val(&env));
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        env.invoke_contract::<Val>(&token, &Symbol::new(&env, "mint"), margs);
+    }));
+
+    // deposit through the vault
+    let mut dargs: SVec<Val> = SVec::new(&env);
+    dargs.push_back(attacker.clone().into_val(&env));
+    dargs.push_back(amount.into_val(&env));
+    let deposited = catch_unwind(AssertUnwindSafe(|| {
+        env.invoke_contract::<Val>(&vault, &Symbol::new(&env, "deposit"), dargs);
+    }))
+    .is_ok();
+    if !deposited {
+        return ("inconclusive".into(), std::vec![("deposit".into(), false, "deposit reverted — ABI mismatch or guarded path".into())]);
+    }
+
+    // internal credit vs real tokens held
+    let mut cargs: SVec<Val> = SVec::new(&env);
+    cargs.push_back(attacker.clone().into_val(&env));
+    let credit: i128 = env.invoke_contract(&vault, &Symbol::new(&env, "credit"), cargs);
+    let mut bargs: SVec<Val> = SVec::new(&env);
+    bargs.push_back(vault.clone().into_val(&env));
+    let held: i128 = env.invoke_contract(&token, &Symbol::new(&env, "balance"), bargs);
+
+    let over = credit - held;
+    let mut records: Vec<(String, bool, String)> = Vec::new();
+    records.push((
+        "deposit".into(),
+        false,
+        format!("attacker deposited {} of a 10% fee-on-transfer token; the vault actually received {}", amount, held),
+    ));
+    records.push((
+        "over-credit".into(),
+        over > 0,
+        if over > 0 {
+            format!("vault credited {} but holds only {} — over-credited by {}; internal accounting exceeds real balance, the vault is insolvent (fee-on-transfer accounting bug)", credit, held, over)
+        } else {
+            format!("vault credited {} == tokens received {} — accounting matches real receipt, held", credit, held)
+        },
+    ));
+    let verdict = if over > 0 { "fee-overcredit" } else { "held" };
+    (verdict.to_string(), records)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(|s| s.as_str()) == Some("--feetoken") {
+        // --feetoken <vault_wasm> <out_json> <fee_token_wasm>
+        let vault = std::fs::read(&args[1]).expect("read vault wasm");
+        let out_path = &args[2];
+        let ft = std::fs::read(&args[3]).expect("read fee_token wasm");
+        let (verdict, records) = probe_feetoken(&vault, &ft);
+        let recs: Vec<String> = records
+            .iter()
+            .map(|(h, b, d)| format!("{{\"probe\":\"{}\",\"bypass\":{},\"detail\":\"{}\"}}", esc(h), b, esc(d)))
+            .collect();
+        let bypasses = records.iter().filter(|(_, b, _)| *b).count();
+        std::fs::write(
+            out_path,
+            format!(
+                "{{\"mode\":\"feetoken\",\"verdict\":\"{}\",\"bypasses\":{},\"probes\":[{}]}}",
+                verdict, bypasses, recs.join(",")
+            ),
+        )
+        .expect("write out");
+        println!("[harness --feetoken] verdict={} bypasses={}/{}", verdict, bypasses, records.len());
+        return;
+    }
 
     if args.first().map(|s| s.as_str()) == Some("--allowance") {
         // --allowance <wasm> <out_json> <fn:types>
