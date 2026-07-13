@@ -387,7 +387,6 @@ sorohunter/
 ├── SPEC.md                        # design spec
 ├── REAL_WORLD.md                  # real-contract precision/recall/live evidence
 ├── SOROBAN_LANGUAGE_STUDY.md      # host deconstruction: 16 classes, 13 negatives
-├── SCF_PUBLIC_GOODS.md            # funding submission (Public Goods, retroactive)
 │
 ├── sorohunter/                    # Python reference (abi, cli, report)
 ├── soro/                          # Rust binary `sorohunter` (in-process, 29 tests)
@@ -443,12 +442,12 @@ Non-negotiables, because the value of this tool is its credibility:
 
 ## Positioning
 
-The funding path ([`SCF_PUBLIC_GOODS.md`](SCF_PUBLIC_GOODS.md)) is the **assurance
-layer + reference capture**, not bounty mining — the AI-security tooling field has
-essentially no smart-contract coverage and none for Soroban, and this session's
-sweeps confirmed empirically that the newest classes have no value-bearing target
-yet. The deliverable is the *proven tooling* and the *taxonomy*: a security public
-good for the ecosystem, ready for the value that follows.
+sorohunter is an **assurance layer + reference capture**, not bounty mining — the
+AI-security tooling field has essentially no smart-contract coverage and none for
+Soroban, and this session's sweeps confirmed empirically that the newest classes
+have no value-bearing target yet. The deliverable is the *proven tooling* and the
+*taxonomy*: security infrastructure for the ecosystem, ready for the value that
+follows.
 
 ## Documents
 

@@ -102,13 +102,10 @@ cryptographic tactic is deliberately marked manual —
 that is ZK-review work (Manuel's slippay-zk / verifier-audit lane), not fork-sim,
 and it is what ties the matrix to the Nethermind verifier wedge.
 
-## Why this is the funding play
+## How the taxonomy operationalizes
 
 Owning a credible, evidence-grounded, executable Soroban ATT&CK is
-reference-capture: the reusable public good the ecosystem cites, with sorohunter
-as the tool that operationalizes it. The SCF Public Goods case becomes "the
-Soroban adversary taxonomy + the fork-validated detector layer," not "a
-missing-auth prober." The proof-carrying finding ledger (on-chain hash of PoC +
-technique-ID + target + timestamp + signature) turns each confirmed detection
-into a public, timestamped "found-first" record keyed by technique — the
-reputation engine.
+reference-capture: sorohunter is the tool that operationalizes the matrix. The
+proof-carrying finding ledger (on-chain hash of PoC + technique-ID + target +
+timestamp + signature) turns each confirmed detection into a public, timestamped
+"found-first" record keyed by technique — the reputation engine.

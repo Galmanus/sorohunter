@@ -1,0 +1,26 @@
+[
+ {
+  "wasm": "ecd990f0b45ca6817149b6175f79b32efb442f35731985a084131e8265c4cd90",
+  "contract": "CDZZM7RQ6AIVNQFTRUNJ36RJRZNJOTYEWJX44GJUDIBPXXQSXEJYLNH6",
+  "invocations": null,
+  "events": 2,
+  "subinvocation": 177,
+  "activity": 179
+ },
+ {
+  "wasm": "07097f83dae3b746db7dba3263d9cc334efb88a9a7d5450fb96ca19f33d284b0",
+  "contract": "CDZZHMVDMHJOBH72PQC66IEE254OHMZWEZ7RN47RTTWMDE2FYDQ7HTFC",
+  "invocations": null,
+  "events": 0,
+  "subinvocation": 19,
+  "activity": 19
+ },
+ {
+  "wasm": "37884c0949fe2ece54ef2f2f41bf3d062f68b0b05f18edf6a0f1232c895a5ebe",
+  "contract": "CDZZWCAJPNDVX4YKLWHHKIUJQBSSANBTZZVLZE62S4ZQV5DCMAVIQ7PP",
+  "invocations": null,
+  "events": 3,
+  "subinvocation": 2,
+  "activity": 5
+ }
+]

@@ -1,0 +1,1 @@
+{"mode":"checkauth","verdict":"deploy-failed","bypasses":0,"probes":[{"hypothesis":"-","context":"-","bypass":false,"detail":"could not deploy (constructor shape unsupported or trapped)"}]}

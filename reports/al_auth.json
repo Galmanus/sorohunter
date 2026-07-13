@@ -1,0 +1,1 @@
+{"mode":"allowance","verdict":"held","bypasses":0,"probes":[{"probe":"victim-approved","bypass":false,"detail":"victim granted the contract a standing allowance of 1000 and holds 1000 before the probe"},{"probe":"empty-auth-pull","bypass":false,"detail":"`pull` reverted under empty auth (the victim's require_auth is unsatisfied) — held"}]}
