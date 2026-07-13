@@ -1,0 +1,26 @@
+{
+  "total_contracts": 20,
+  "unique_wasm": 3,
+  "check_auth_wasm_count": 1,
+  "check_auth_instances": 2,
+  "check_auth_instances_with_activity": 1,
+  "check_auth_wasm_hashes": [
+    "ecd990f0b45ca6817149b6175f79b32efb442f35731985a084131e8265c4cd90"
+  ],
+  "top_instances": [
+    {
+      "contract": "CDZZM7RQ6AIVNQFTRUNJ36RJRZNJOTYEWJX44GJUDIBPXXQSXEJYLNH6",
+      "wasm": "ecd990f0b45ca6817149b6175f79b32efb442f35731985a084131e8265c4cd90",
+      "activity": 2,
+      "invocations": null,
+      "events": 2
+    },
+    {
+      "contract": "CDZZI2F7EC22B6CEGETFYLZA5AJUWOYUUJI4LM6LABYCZI2GBYHGZ634",
+      "wasm": "ecd990f0b45ca6817149b6175f79b32efb442f35731985a084131e8265c4cd90",
+      "activity": 0,
+      "invocations": 0,
+      "events": 0
+    }
+  ]
+}

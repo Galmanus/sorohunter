@@ -53,6 +53,7 @@ Two things live in this repo:
 - [The two axioms](#the-two-axioms)
 - [Architecture](#architecture)
 - [Shipped detectors (the full inventory)](#shipped-detectors-the-full-inventory)
+- [The auth-bypass provers — smart accounts / passkey wallets](#the-auth-bypass-provers--smart-accounts--passkey-wallets)
 - [The Soroban ATT&CK matrix](#the-soroban-attck-matrix)
 - [The oracle layer — language deconstruction](#the-oracle-layer--language-deconstruction)
 - [CLI usage](#cli-usage)
@@ -171,6 +172,37 @@ or **manual** (cryptographic/business-logic) — marked honestly there.
 
 ---
 
+## The auth-bypass provers — smart accounts / passkey wallets
+
+Every detector above screens business functions under `mock_all_auths()`, which
+**skips `__check_auth` entirely**. A separate stage does the opposite: it runs a
+smart account's *real* `__check_auth` via `try_invoke_contract_check_auth` (no
+mock) and proves an authorization bypass **by execution**. This is the highest-
+value target class on Soroban — a bug in a widely-replicated passkey/wallet kit
+ripples to every wallet built on it. Full write-up and honest limits in
+[`AUTH_BYPASS.md`](AUTH_BYPASS.md).
+
+| Mode | Class | What it proves (executed) |
+|---|---|---|
+| `--checkauth` | ignores / type-confuses the signature | a forgery battery (void, empty, zero-64, garbage-64, wrong-type) that **no honest signer produces** is accepted → `Ok(())` = bypass. Zero false positives by construction |
+| `--replay` | signature not bound to payload (synthetic 96-byte ABI) | one genuine `(msg, sig)` pair authorizes a **different** payload — the binding bug, on a controlled fixture ABI |
+| `--realauth` | real passkey-kit **ed25519** signer branch | deploys the actual `Signer`-constructor wasm and drives its genuine `__check_auth` with a real ed25519 signature in the target's own `Signatures(Map<SignerKey,Signature>)` type |
+| `--realauth-p256` | real passkey-kit **secp256r1 / WebAuthn** signer branch | forges a genuine WebAuthn assertion (authenticatorData + clientDataJSON + ECDSA-secp256r1) and tests cross-payload replay — the swig-wallet #143 challenge-binding class, where the bug that actually ships lives |
+
+Ground truth is a set of paired safe-vs-vuln fixtures in [`bench/`](bench/) gated by
+`tests/test_checkauth.py` and `tests/test_realauth.py`: the `good_account` /
+`bound_passkey` controls **must** show zero bypass (if they ever flag, the prover
+is worthless), while `blind_account`, `void_guard_account`, `unbound_account`, and
+`unbound_passkey` each carry a distinct planted bug the prover reads specifically.
+`--realauth-p256` has been run against the only mainnet wasm the census found that
+exports `__check_auth` (a passkey-kit smart wallet): the encoder **reaches its real
+secp256r1 `__check_auth`** (a genuine assertion is accepted) and the wallet
+correctly **holds** — a grounded result on real code, not a fixture. Zero real
+bypasses found so far; see [`AUTH_BYPASS.md`](AUTH_BYPASS.md) for why that is a
+census-coverage question, not a capability one.
+
+---
+
 ## The Soroban ATT&CK matrix
 
 [`SOROBAN_ATTACK.md`](SOROBAN_ATTACK.md) is the taxonomy: tactics × techniques,
@@ -249,6 +281,18 @@ $BIN probe path/to/contract.wasm   # probe a local WASM
 $BIN scan  CBQD... mainnet         # read-only acquire + ABI-fork
 $BIN scan  CBQD... mainnet --fork  # STATE-FORK: pull real on-chain state via RPC
 $BIN roundtrip CBQD... mainnet     # value-conservation (broken-math) lens
+```
+
+**Auth-bypass provers (`harness/`, runs the real `__check_auth`):**
+
+```bash
+cd harness && cargo build --release && cd ..
+BIN=./harness/target/release/harness
+
+$BIN --checkauth      <wasm> <out.json> <ctor_csv>   # forgery battery on __check_auth
+$BIN --replay         <wasm> <out.json> <ctor_csv>   # cross-payload replay (synthetic ABI)
+$BIN --realauth       <wasm> <out.json>              # real passkey-kit ed25519 branch
+$BIN --realauth-p256  <wasm> <out.json>              # real passkey-kit secp256r1 / WebAuthn branch
 ```
 
 `scan --fork` is what upgrades an ABI finding to a value finding: it lazily fetches
