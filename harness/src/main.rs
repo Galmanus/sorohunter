@@ -1004,6 +1004,164 @@ fn probe_allowance(wasm: &[u8], fn_name: &str) -> (String, Vec<(String, bool, St
     (verdict.to_string(), records)
 }
 
+/// P2/P3: economic multi-call fuzzer. Sets up a real token, a funded target, and
+/// an attacker; fuzzes SEQUENCES of the target's economic functions with the
+/// attacker as the (legitimately authorized) actor; and reports any sequence that
+/// leaves the attacker with MORE tokens than they started with — net profit
+/// drained from the protocol. This finds economic bugs that (a) auth-scan misses
+/// (every call is authorized) and (b) single-shot misses (the drain needs a
+/// specific multi-call sequence). The invariant is composition-level solvency,
+/// exactly what per-contract formal verification does not model.
+///
+/// v1 convention: economic fns are `<name>(from: Address, amount: i128)`; the
+/// target has a single-Address (token) constructor. Amount is fixed so the fn
+/// SEQUENCE is the only variable (the bug is the sequence, not the value).
+struct ERng(u64);
+impl ERng {
+    fn next(&mut self, n: usize) -> usize {
+        let mut x = self.0;
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        self.0 = x;
+        if n == 0 { 0 } else { (x % n as u64) as usize }
+    }
+}
+
+fn econ_replay(target_wasm: &[u8], fns: &[String], seq: &[usize], amount: i128) -> Option<(i128, usize)> {
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = sac.address();
+        let w = target_wasm.to_vec();
+        let tkc = token.clone();
+        let target = env.register(w.as_slice(), (tkc,));
+        let attacker = Address::generate(&env);
+        let start: i128 = 1_000;
+        let reserve: i128 = 1_000_000;
+        StellarAssetClient::new(&env, &token).mint(&attacker, &start);
+        StellarAssetClient::new(&env, &token).mint(&target, &reserve);
+        let exp = env.ledger().sequence() + 100_000;
+        TokenClient::new(&env, &token).approve(&attacker, &target, &(start * 100), &exp);
+        let bal = |e: &Env, t: &Address, a: &Address| -> i128 { TokenClient::new(e, t).balance(a) };
+        let start_bal = bal(&env, &token, &attacker);
+        let mut best: i128 = 0;
+        let mut best_step = 0usize;
+        for (step, &fi) in seq.iter().enumerate() {
+            let mut args: SVec<Val> = SVec::new(&env);
+            args.push_back(attacker.clone().into_val(&env));
+            args.push_back(amount.into_val(&env));
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                env.invoke_contract::<Val>(&target, &Symbol::new(&env, &fns[fi]), args);
+            }));
+            let profit = bal(&env, &token, &attacker) - start_bal;
+            if profit > best { best = profit; best_step = step + 1; }
+        }
+        (best, best_step)
+    }));
+    r.ok()
+}
+
+fn probe_econ(target_wasm: &[u8], fns: &[String]) -> (String, Vec<(String, bool, String)>) {
+    let amount: i128 = 100;
+    let max_seq = 5usize;
+    let rounds = 400u32;
+    let mut corpus: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut rng = ERng(0x2545f4914f6cdd1d);
+    let mut hit: Option<(Vec<usize>, i128)> = None;
+    for _ in 0..rounds {
+        let base = corpus[rng.next(corpus.len())].clone();
+        let mut seq = base;
+        if seq.len() < max_seq { seq.push(rng.next(fns.len())); }
+        else if !seq.is_empty() { let l = seq.len() - 1; seq[l] = rng.next(fns.len()); }
+        if let Some((profit, _step)) = econ_replay(target_wasm, fns, &seq, amount) {
+            if profit > 0 { hit = Some((seq.clone(), profit)); break; }
+            // crude coverage: keep any sequence that ran (grows the corpus)
+            corpus.push(seq);
+            if corpus.len() > 200 { corpus.remove(1); }
+        }
+    }
+    let mut records: Vec<(String, bool, String)> = Vec::new();
+    if let Some((seq, profit)) = hit {
+        // shrink
+        let mut cur = seq;
+        let mut i = 0;
+        while i < cur.len() {
+            let mut trial = cur.clone(); trial.remove(i);
+            match econ_replay(target_wasm, fns, &trial, amount) {
+                Some((p, _)) if p > 0 => cur = trial,
+                _ => i += 1,
+            }
+        }
+        let path = cur.iter().map(|&i| fns[i].clone()).collect::<Vec<_>>().join(" -> ");
+        records.push(("net-profit".into(), true, format!(
+            "attacker ended +{} tokens over start via the {}-call sequence [{}] (amount {} each) — value drained from the protocol; every call authorized, no single call is a finding",
+            profit, cur.len(), path, amount)));
+        ("econ-drain".to_string(), records)
+    } else {
+        records.push(("net-profit".into(), false, "no sequence left the attacker in profit — solvency held under fuzzing".into()));
+        ("held".to_string(), records)
+    }
+}
+
+/// EMPIRICAL PROBE (not a shipped detector): does Soroban's auth model permit a
+/// confused-deputy? victim.forward(attacker) -> attacker.poke() -> victim.set_flag()
+/// where set_flag is gated by the victim's OWN (current-contract) auth. If the flag
+/// is set, a contract's authority propagates through a re-entrant sub-call it did
+/// not directly make (TD-02 is real). If it reverts, Soroban blocks it (a TD-02
+/// detector would be theater). Returns whether the attack succeeded.
+fn probe_deputy(victim_wasm: &[u8], attacker_wasm: &[u8]) -> (String, Vec<(String, bool, String)>) {
+    let env = Env::default();
+    let vw = victim_wasm.to_vec();
+    let ev = env.clone();
+    let victim = ev.register(vw.as_slice(), ());
+    let aw = attacker_wasm.to_vec();
+    let vic = victim.clone();
+    let ea = env.clone();
+    let attacker = ea.register(aw.as_slice(), (vic,));
+
+    let call_forward = |mock: bool| -> bool {
+        let e = Env::default();
+        let v = e.register(victim_wasm.to_vec().as_slice(), ());
+        let a = e.register(attacker_wasm.to_vec().as_slice(), (v.clone(),));
+        if mock {
+            e.mock_all_auths();
+        } else {
+            e.set_auths(&[]);
+        }
+        let mut fargs: SVec<Val> = SVec::new(&e);
+        fargs.push_back(a.into_val(&e));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            e.invoke_contract::<Val>(&v, &Symbol::new(&e, "forward"), fargs);
+        }));
+        e.mock_all_auths();
+        e.invoke_contract::<bool>(&v, &Symbol::new(&e, "flag"), SVec::new(&e))
+    };
+    let _ = (&victim, &attacker); // deployed above only to validate the wasm loads
+
+    let with_auth = call_forward(true); // control: does the mechanism work at all?
+    let empty_auth = call_forward(false); // attack: attacker has no victim authority
+
+    let mut records: Vec<(String, bool, String)> = Vec::new();
+    records.push((
+        "mechanism-control".into(),
+        false,
+        format!("under mock_all_auths the reentrant chain set the flag = {} (proves the call path works when authorized)", with_auth),
+    ));
+    records.push((
+        "confused-deputy-attack".into(),
+        empty_auth,
+        if empty_auth {
+            "REAL: with NO victim authorization the reentrant set_flag still succeeded — the victim's authority propagated. TD-02 is exploitable; ship the detector.".into()
+        } else {
+            "BLOCKED: with no victim authorization the reentrant set_flag reverted. The victim's contract authority does NOT propagate to a re-entrant sub-call it did not directly authorize. Soroban's per-subtree auth prevents the EVM/Solana-style confused-deputy — a TD-02 detector would be theater.".into()
+        },
+    ));
+    let verdict = if empty_auth { "deputy-exploitable" } else { "deputy-blocked" };
+    (verdict.to_string(), records)
+}
+
 /// Auth-arg scope-mismatch prover (TA-04). A payment fn that authorizes the payer
 /// with `require_auth_for_args` scoped too narrowly (omitting the recipient /
 /// amount) lets one authorization be replayed to any recipient. The prover mocks
@@ -1160,6 +1318,30 @@ fn probe_feetoken(vault_wasm: &[u8], fee_token_wasm: &[u8]) -> (String, Vec<(Str
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(|s| s.as_str()) == Some("--econ") {
+        // --econ <wasm> <out_json> <fn1,fn2,...>
+        let wasm = std::fs::read(&args[1]).expect("read wasm");
+        let out_path = &args[2];
+        let fns: Vec<String> = args.get(3).map(|s| s.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_else(|| std::vec!["deposit".into(), "withdraw".into()]);
+        let (verdict, records) = probe_econ(&wasm, &fns);
+        let recs: Vec<String> = records.iter().map(|(h, b, d)| format!("{{\"probe\":\"{}\",\"bypass\":{},\"detail\":\"{}\"}}", esc(h), b, esc(d))).collect();
+        let bypasses = records.iter().filter(|(_, b, _)| *b).count();
+        std::fs::write(out_path, format!("{{\"mode\":\"econ\",\"verdict\":\"{}\",\"bypasses\":{},\"probes\":[{}]}}", verdict, bypasses, recs.join(","))).expect("write out");
+        println!("[harness --econ] verdict={} bypasses={}/{}", verdict, bypasses, records.len());
+        return;
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("--deputy") {
+        let vw = std::fs::read(&args[1]).expect("read victim wasm");
+        let aw = std::fs::read(&args[2]).expect("read attacker wasm");
+        let (verdict, records) = probe_deputy(&vw, &aw);
+        for (h, b, d) in &records {
+            println!("[--deputy] {} bypass={} :: {}", h, b, d);
+        }
+        println!("[--deputy] verdict={}", verdict);
+        return;
+    }
 
     if args.first().map(|s| s.as_str()) == Some("--scope") {
         // --scope <wasm> <out_json>
