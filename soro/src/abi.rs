@@ -91,6 +91,97 @@ pub fn parse_spec(entries: &[Value]) -> Vec<FnPlan> {
 // ---- native spec-from-wasm (no stellar-CLI shell-out) ----
 
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecTypeDef};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+/// A user-defined type's shape, in string labels the engine's synth understands.
+/// This is the ABI-driven answer to "unsynthesizable udt:Signer": we read the
+/// contractspec's UDT definitions and build a matching Val recursively, instead
+/// of skipping the function. (SorobanArbitrary does this from the compiled Rust
+/// type at dev-time; here we do it from the deployed wasm's spec, black-box.)
+#[derive(Clone, Debug)]
+pub enum UdtDef {
+    /// (field_name, type_label). Empty field_name => positional/tuple struct.
+    Struct(Vec<(String, String)>),
+    /// (variant_name, type_labels_of_the_variant_payload).
+    Union(Vec<(String, Vec<String>)>),
+    /// integer enum; the first case's discriminant value.
+    Enum(u32),
+}
+
+thread_local! {
+    /// UDT name -> shape, populated per `plan_from_wasm`. Read by the engine's synth.
+    pub static UDT_REGISTRY: RefCell<HashMap<String, UdtDef>> = RefCell::new(HashMap::new());
+}
+
+fn label_of(t: &ScSpecTypeDef) -> String {
+    typedef_name(t)
+}
+
+/// Can we build a Val for this label, recursing through the UDT registry?
+pub fn label_synthesizable(label: &str, reg: &HashMap<String, UdtDef>, depth: u32) -> bool {
+    if depth > 6 {
+        return false;
+    }
+    if PRIMITIVES.contains(&label) || label.starts_with("bytes_n:") {
+        return true;
+    }
+    if label.starts_with("vec<") || label.starts_with("option<") || label == "map" || label == "void" {
+        return true; // empty vec / None / empty map are always valid
+    }
+    if let Some(name) = label.strip_prefix("udt:") {
+        return match reg.get(name) {
+            Some(UdtDef::Enum(_)) => true,
+            Some(UdtDef::Struct(fields)) => fields.iter().all(|(_, t)| label_synthesizable(t, reg, depth + 1)),
+            Some(UdtDef::Union(variants)) => variants
+                .first()
+                .map(|(_, ts)| ts.iter().all(|t| label_synthesizable(t, reg, depth + 1)))
+                .unwrap_or(true),
+            None => false,
+        };
+    }
+    false
+}
+
+/// Build the UDT registry from all spec entries (structs, unions, enums).
+fn build_registry(entries: &[ScSpecEntry]) -> HashMap<String, UdtDef> {
+    let mut reg = HashMap::new();
+    for e in entries {
+        match e {
+            ScSpecEntry::UdtStructV0(s) => {
+                let fields = s
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let n = f.name.to_string();
+                        // soroban tuple-structs name fields "0","1",...; treat as positional.
+                        let name = if n.chars().all(|c| c.is_ascii_digit()) { String::new() } else { n };
+                        (name, label_of(&f.type_))
+                    })
+                    .collect();
+                reg.insert(s.name.to_string(), UdtDef::Struct(fields));
+            }
+            ScSpecEntry::UdtUnionV0(u) => {
+                use soroban_sdk::xdr::ScSpecUdtUnionCaseV0 as C;
+                let variants = u
+                    .cases
+                    .iter()
+                    .map(|c| match c {
+                        C::VoidV0(v) => (v.name.to_string(), Vec::new()),
+                        C::TupleV0(t) => (t.name.to_string(), t.type_.iter().map(label_of).collect()),
+                    })
+                    .collect();
+                reg.insert(u.name.to_string(), UdtDef::Union(variants));
+            }
+            ScSpecEntry::UdtEnumV0(en) => {
+                let first = en.cases.first().map(|c| c.value).unwrap_or(0);
+                reg.insert(en.name.to_string(), UdtDef::Enum(first));
+            }
+            _ => {}
+        }
+    }
+    reg
+}
 
 /// Canonical type label from an XDR `ScSpecTypeDef` — the native mirror of
 /// `type_name` (which works on the CLI's JSON).
@@ -138,14 +229,19 @@ pub fn plan_from_wasm(wasm: &[u8]) -> Vec<FnPlan> {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
+    // ABI-driven UDT synthesis: register every struct/union/enum so the engine can
+    // build their Vals instead of skipping the function (P0 coverage upgrade).
+    let reg = build_registry(&entries);
+    UDT_REGISTRY.with(|r| *r.borrow_mut() = reg.clone());
     let mut plan = Vec::new();
     for e in entries {
         if let ScSpecEntry::FunctionV0(f) = e {
             let name = f.name.to_string();
             let inputs: Vec<String> = f.inputs.iter().map(|i| typedef_name(&i.type_)).collect();
             let unsynth: Vec<String> =
-                f.inputs.iter().filter(|i| !typedef_synthesizable(&i.type_)).map(|i| typedef_name(&i.type_)).collect();
+                inputs.iter().filter(|l| !label_synthesizable(l, &reg, 0)).cloned().collect();
             let synthesizable = unsynth.is_empty();
+            let _ = typedef_synthesizable; // legacy primitive check retained for reference
             plan.push(FnPlan {
                 name,
                 inputs,
@@ -203,6 +299,23 @@ mod tests {
         assert_eq!(plan[1].name, "swap");
         assert!(!plan[1].synthesizable);
         assert!(plan[1].skip_reason.as_ref().unwrap().contains("udt:Order"));
+    }
+
+    #[test]
+    fn udt_synthesizable_via_registry() {
+        // ABI-driven UDT synthesis (P0): a struct of buildable fields is
+        // synthesizable, recursion works, and unknown/unbuildable leaves fail.
+        let mut reg = HashMap::new();
+        reg.insert("Signer".to_string(), UdtDef::Struct(vec![("pk".into(), "bytes_n:32".into())]));
+        reg.insert("Deep".to_string(), UdtDef::Struct(vec![("s".into(), "udt:Signer".into())]));
+        reg.insert("Kind".to_string(), UdtDef::Union(vec![("Ed".into(), vec!["bytes_n:32".into()])]));
+        reg.insert("Bad".to_string(), UdtDef::Struct(vec![("x".into(), "muxed_address".into())]));
+        assert!(label_synthesizable("udt:Signer", &reg, 0));
+        assert!(label_synthesizable("udt:Deep", &reg, 0)); // recurses into Signer
+        assert!(label_synthesizable("udt:Kind", &reg, 0)); // union first variant
+        assert!(label_synthesizable("vec<udt:Signer>", &reg, 0)); // empty vec is valid
+        assert!(!label_synthesizable("udt:Bad", &reg, 0)); // muxed_address not buildable
+        assert!(!label_synthesizable("udt:Unknown", &reg, 0)); // not in registry
     }
 
     #[test]

@@ -52,6 +52,52 @@ fn synth(env: &Env, t: &str, attacker: Option<&Address>) -> Option<Val> {
         let n: usize = nn.parse().ok()?;
         return Some(Bytes::from_slice(env, &std::vec![0u8; n]).into_val(env));
     }
+    // ABI-driven composite / UDT synthesis (P0): build structured Vals from the
+    // contractspec instead of skipping the function.
+    if t == "void" {
+        return Some(().into_val(env));
+    }
+    if t == "map" {
+        return Some(soroban_sdk::Map::<Val, Val>::new(env).into_val(env));
+    }
+    if t.starts_with("vec<") {
+        return Some(SVec::<Val>::new(env).into_val(env)); // empty vec
+    }
+    if t.starts_with("option<") {
+        return Some(().into_val(env)); // None
+    }
+    if let Some(name) = t.strip_prefix("udt:") {
+        // Clone the def out of the thread-local before recursing (synth re-enters
+        // the registry for nested fields; a held borrow would panic).
+        let def = crate::abi::UDT_REGISTRY.with(|r| r.borrow().get(name).cloned())?;
+        return match def {
+            crate::abi::UdtDef::Enum(v) => Some(v.into_val(env)),
+            crate::abi::UdtDef::Struct(fields) => {
+                if !fields.is_empty() && fields.iter().all(|(n, _)| n.is_empty()) {
+                    let mut v: SVec<Val> = SVec::new(env);
+                    for (_, ty) in &fields {
+                        v.push_back(synth(env, ty, None)?);
+                    }
+                    Some(v.into_val(env))
+                } else {
+                    let mut m: soroban_sdk::Map<Symbol, Val> = soroban_sdk::Map::new(env);
+                    for (fname, ty) in &fields {
+                        m.set(Symbol::new(env, fname), synth(env, ty, None)?);
+                    }
+                    Some(m.into_val(env))
+                }
+            }
+            crate::abi::UdtDef::Union(variants) => {
+                let (vname, payload) = variants.first()?.clone();
+                let mut v: SVec<Val> = SVec::new(env);
+                v.push_back(Symbol::new(env, &vname).into_val(env));
+                for ty in &payload {
+                    v.push_back(synth(env, ty, None)?);
+                }
+                Some(v.into_val(env))
+            }
+        };
+    }
     Some(match t {
         "u32" => 0u32.into_val(env),
         "i32" => 0i32.into_val(env),
