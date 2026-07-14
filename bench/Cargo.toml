@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["liar_token", "liar_oracle", "vuln_vault", "safe_vault", "chain_vault", "safe_chain_vault", "upgrade_vault", "safe_upgrade_vault", "attacker_pwn", "good_account", "blind_account", "void_guard_account", "unbound_account", "bound_account", "bound_passkey", "unbound_passkey", "unauth_pull", "auth_pull", "fee_token", "fee_vault_vuln", "fee_vault_safe", "scoped_vuln", "scoped_safe", "seq_vuln", "seq_safe"]
+members = ["liar_token", "liar_oracle", "vuln_vault", "safe_vault", "chain_vault", "safe_chain_vault", "upgrade_vault", "safe_upgrade_vault", "attacker_pwn", "good_account", "blind_account", "void_guard_account", "unbound_account", "bound_account", "bound_passkey", "unbound_passkey", "unauth_pull", "auth_pull", "fee_token", "fee_vault_vuln", "fee_vault_safe", "scoped_vuln", "scoped_safe", "seq_vuln", "seq_safe", "econ_vuln", "econ_safe"]
 
 [workspace.dependencies]
 soroban-sdk = "25.0.1"
