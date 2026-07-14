@@ -339,6 +339,60 @@ fn synth_fuzz(env: &Env, t: &str, attacker: &Address, rng: &mut Rng) -> Option<V
     })
 }
 
+/// Replay a fixed sequence under empty auth from a fresh deploy; return the first
+/// breach objective it hits (fn_name, event_delta, step). Used for shrinking a
+/// found sequence to its minimal reproducer.
+fn replay_breach(wasm: &[u8], ctor: &[String], fns: &[&FnPlan], seq: &[usize]) -> Option<(String, i64, usize)> {
+    let mut rng = Rng(0xd1b54a32d192ed03);
+    catch_unwind(AssertUnwindSafe(|| {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = try_deploy(&env, wasm, ctor)?;
+        let attacker = Address::generate(&env);
+        env.set_auths(&[]);
+        for (step, &fi) in seq.iter().enumerate() {
+            let p = fns[fi];
+            let mut a: SVec<Val> = SVec::new(&env);
+            let mut ok = true;
+            for t in &p.inputs {
+                match synth_fuzz(&env, t, &attacker, &mut rng) {
+                    Some(v) => a.push_back(v),
+                    None => { ok = false; break; }
+                }
+            }
+            if !ok { break; }
+            let before = env.events().all().events().len() as i64;
+            let res = env.try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, &p.name), a);
+            let after = env.events().all().events().len() as i64;
+            let delta = after - before;
+            if res.is_ok() && delta > 0 && !is_init_name(&p.name) {
+                return Some((p.name.clone(), delta, step + 1));
+            }
+        }
+        None
+    }))
+    .ok()
+    .flatten()
+}
+
+/// Greedily drop calls from a triggering sequence while it still reaches the same
+/// breaching function — the minimal reproducer (corpus shrinking).
+fn shrink_seq(wasm: &[u8], ctor: &[String], fns: &[&FnPlan], seq: &[usize], target_fn: &str) -> Vec<usize> {
+    let mut cur = seq.to_vec();
+    let mut i = 0;
+    while i < cur.len() {
+        let mut trial = cur.clone();
+        trial.remove(i);
+        match replay_breach(wasm, ctor, fns, &trial) {
+            Some((f, _, _)) if f == target_fn => {
+                cur = trial; // drop kept the bug; don't advance i (list shifted)
+            }
+            _ => i += 1,
+        }
+    }
+    cur
+}
+
 /// P1: stateful, coverage-guided sequence fuzzer. Explores SEQUENCES of calls
 /// maintaining state, checking the empty-auth breach objective after each call —
 /// finding bugs that only trigger after a specific setup sequence, which
@@ -413,18 +467,20 @@ pub fn probe_fuzz(wasm: &[u8], plan: &[FnPlan], rounds: u32, max_seq: usize) -> 
         }));
         if let Ok(Some((new_cov, seq, hit))) = run {
             if new_cov {
-                corpus.push(seq);
+                corpus.push(seq.clone());
             }
-            if let Some((fname, path, delta, step)) = hit {
+            if let Some((fname, _path, delta, _step)) = hit {
                 if found.insert(fname.clone()) {
+                    let minimal = shrink_seq(wasm, &ctor, &fns, &seq, &fname);
+                    let path = minimal.iter().map(|&i| fns[i].name.clone()).collect::<Vec<_>>().join(" -> ");
                     findings.push(Verdict {
                         fn_name: fname.clone(),
                         arg_types: String::new(),
                         verdict: "breach".into(),
                         events_delta: delta,
                         detail: format!(
-                            "state change under empty auth at step {}, reachable only via the sequence [{}] — stateful finding a single-shot probe misses",
-                            step, path
+                            "state change under empty auth, reachable only via the {}-call sequence [{}] — stateful finding a single-shot probe misses (minimized)",
+                            minimal.len(), path
                         ),
                     });
                 }
