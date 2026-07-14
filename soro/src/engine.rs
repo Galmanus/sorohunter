@@ -8,6 +8,7 @@
 //! Every probe executes only in a local `Env` against public WASM; nothing ever
 //! touches a live network.
 
+use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
@@ -305,6 +306,134 @@ pub fn probe_contract(wasm: &[u8], attacker_wasm: &[u8], plan: &[FnPlan]) -> Vec
 /// real address with real admin/config, so a breach here is CONFIRMED — not a
 /// fresh-deploy candidate — and one-time initializers revert naturally (no
 /// heuristic). Single-fn for v1; chains/upgrades stay in fresh-deploy mode.
+/// Deterministic xorshift PRNG — reproducible fuzzing (fixed seed, like Echidna),
+/// no external rand dep, and no wall-clock/entropy.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self, n: usize) -> usize {
+        // xorshift64
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        if n == 0 { 0 } else { (x % n as u64) as usize }
+    }
+}
+
+/// Value synthesizer with a fuzz seed: picks varied values (boundaries + the
+/// attacker) instead of the single default, so the fuzzer explores the input
+/// space. Falls back to the ABI-driven `synth` for structured/UDT types.
+fn synth_fuzz(env: &Env, t: &str, attacker: &Address, rng: &mut Rng) -> Option<Val> {
+    let pick = rng.next(4);
+    Some(match t {
+        "address" => if pick == 0 { attacker.clone().into_val(env) } else { Address::generate(env).into_val(env) },
+        "u32" => [0u32, 1, u32::MAX, rng.next(1_000_000) as u32][pick].into_val(env),
+        "i32" => [0i32, 1, i32::MAX, -1][pick].into_val(env),
+        "u64" => [0u64, 1, u64::MAX, rng.next(1_000_000) as u64][pick].into_val(env),
+        "i64" => [0i64, 1, i64::MAX, -1][pick].into_val(env),
+        "u128" => [0u128, 1, u128::MAX, rng.next(1_000_000) as u128][pick].into_val(env),
+        "i128" => [0i128, 1, i128::MAX, -1][pick].into_val(env),
+        "bool" => (pick % 2 == 0).into_val(env),
+        _ => return synth(env, t, Some(attacker)),
+    })
+}
+
+/// P1: stateful, coverage-guided sequence fuzzer. Explores SEQUENCES of calls
+/// maintaining state, checking the empty-auth breach objective after each call —
+/// finding bugs that only trigger after a specific setup sequence, which
+/// single-shot probing structurally cannot reach. Coverage-guided: a sequence
+/// that reaches a new (fn, outcome) is kept in the corpus and extended. Snapshot
+/// via replay-from-scratch (deterministic).
+pub fn probe_fuzz(wasm: &[u8], plan: &[FnPlan], rounds: u32, max_seq: usize) -> Vec<Verdict> {
+    let ctor: Vec<String> = plan
+        .iter()
+        .find(|p| p.name == "__constructor")
+        .map(|p| p.inputs.clone())
+        .unwrap_or_default();
+    let fns: Vec<&FnPlan> = plan
+        .iter()
+        .filter(|p| p.name != "__constructor" && p.synthesizable)
+        .collect();
+    if fns.is_empty() {
+        return Vec::new();
+    }
+    let mut corpus: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut coverage: HashSet<String> = HashSet::new();
+    let mut found: HashSet<String> = HashSet::new();
+    let mut findings: Vec<Verdict> = Vec::new();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+
+    for _ in 0..rounds {
+        let base = corpus[rng.next(corpus.len())].clone();
+        let mut seq = base;
+        let pick = fns.len();
+        if seq.len() < max_seq {
+            seq.push(rng.next(pick));
+        } else if !seq.is_empty() {
+            let l = seq.len() - 1;
+            seq[l] = rng.next(pick);
+        }
+        let run = catch_unwind(AssertUnwindSafe(|| {
+            let env = Env::default();
+            env.mock_all_auths();
+            let cid = try_deploy(&env, wasm, &ctor)?;
+            let attacker = Address::generate(&env);
+            env.set_auths(&[]);
+            let mut new_cov = false;
+            let mut hit: Option<(String, String, i64, usize)> = None;
+            for (step, &fi) in seq.iter().enumerate() {
+                let p = fns[fi];
+                let args = {
+                    let mut a: SVec<Val> = SVec::new(&env);
+                    let mut ok = true;
+                    for t in &p.inputs {
+                        match synth_fuzz(&env, t, &attacker, &mut rng) {
+                            Some(v) => a.push_back(v),
+                            None => { ok = false; break; }
+                        }
+                    }
+                    if !ok { break; }
+                    a
+                };
+                let before = env.events().all().events().len() as i64;
+                let res = env.try_invoke_contract::<Val, soroban_sdk::Error>(&cid, &Symbol::new(&env, &p.name), args);
+                let after = env.events().all().events().len() as i64;
+                let delta = after - before;
+                let outcome = if res.is_ok() { if delta > 0 { "mut" } else { "view" } } else { "revert" };
+                if coverage.insert(format!("{}:{}", p.name, outcome)) {
+                    new_cov = true;
+                }
+                if res.is_ok() && delta > 0 && !is_init_name(&p.name) && seq.len() > 1 {
+                    let path = seq.iter().map(|&i| fns[i].name.clone()).collect::<Vec<_>>().join(" -> ");
+                    hit = Some((p.name.clone(), path, delta, step + 1));
+                }
+            }
+            Some((new_cov, seq.clone(), hit))
+        }));
+        if let Ok(Some((new_cov, seq, hit))) = run {
+            if new_cov {
+                corpus.push(seq);
+            }
+            if let Some((fname, path, delta, step)) = hit {
+                if found.insert(fname.clone()) {
+                    findings.push(Verdict {
+                        fn_name: fname.clone(),
+                        arg_types: String::new(),
+                        verdict: "breach".into(),
+                        events_delta: delta,
+                        detail: format!(
+                            "state change under empty auth at step {}, reachable only via the sequence [{}] — stateful finding a single-shot probe misses",
+                            step, path
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    findings
+}
+
 pub fn probe_forked(snapshot: &LedgerSnapshot, contract_id: &str, plan: &[FnPlan]) -> Vec<Verdict> {
     let mut out = Vec::new();
     for p in plan.iter().filter(|p| p.name != "__constructor") {

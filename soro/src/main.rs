@@ -108,6 +108,40 @@ fn cmd_probe(wasms: &[String]) -> i32 {
     0
 }
 
+/// P1 stateful coverage-guided fuzzer over a local WASM file. Explores call
+/// sequences to find bugs that need a setup sequence (which single-shot probing
+/// misses). Deterministic (fixed seed).
+fn cmd_fuzz(wasms: &[String], rounds: u32, seq: usize) -> i32 {
+    let mut total = 0usize;
+    for w in wasms {
+        if !std::path::Path::new(w).exists() {
+            eprintln!("skip (no file): {}", w);
+            continue;
+        }
+        let wasm = match std::fs::read(w) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let plan = abi::plan_from_wasm(&wasm);
+        if plan.is_empty() {
+            eprintln!("skip (no spec): {}", w);
+            continue;
+        }
+        let label = std::path::Path::new(w).file_stem().unwrap().to_string_lossy().into_owned();
+        let verdicts = engine::probe_fuzz(&wasm, &plan, rounds, seq);
+        println!("\n{} (fuzz: {} rounds, seq<={})", label, rounds, seq);
+        if verdicts.is_empty() {
+            println!("  clean — no sequence triggered an objective");
+        }
+        for v in &verdicts {
+            println!("  [{:<7}] {}  {}", report::mark(&v.verdict), v.fn_name, v.detail);
+        }
+        total += verdicts.len();
+    }
+    println!("\n{} stateful finding(s)", total);
+    0
+}
+
 /// Acquire a public contract read-only (fetch WASM + spec via the stellar CLI)
 /// and probe a local fork. Never touches the deployed contract.
 /// Network passphrase hash (sha256) — mainnet / testnet, hardcoded constants.
@@ -478,6 +512,25 @@ fn main() {
             cmd_roundtrip(&id, &network)
         }
         Some("probe") if args.len() > 1 => cmd_probe(&args[1..]),
+        Some("fuzz") if args.len() > 1 => {
+            let mut wasms = Vec::new();
+            let mut rounds = 300u32;
+            let mut seq = 4usize;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--rounds" && i + 1 < args.len() {
+                    rounds = args[i + 1].parse().unwrap_or(300);
+                    i += 2;
+                } else if args[i] == "--seq" && i + 1 < args.len() {
+                    seq = args[i + 1].parse().unwrap_or(4);
+                    i += 2;
+                } else {
+                    wasms.push(args[i].clone());
+                    i += 1;
+                }
+            }
+            cmd_fuzz(&wasms, rounds, seq)
+        }
         Some("scan") if args.len() > 1 => {
             let id = args[1].clone();
             let mut network = "testnet".to_string();
