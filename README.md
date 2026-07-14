@@ -277,11 +277,21 @@ cd soro && cargo build --release
 BIN=./target/release/sorohunter
 
 $BIN bench                         # ground-truth corpus, precision/recall
-$BIN probe path/to/contract.wasm   # probe a local WASM
+$BIN probe path/to/contract.wasm   # single-shot probe a local WASM
+$BIN fuzz  path/to/contract.wasm --rounds 300  # STATEFUL coverage-guided sequence fuzzer
 $BIN scan  CBQD... mainnet         # read-only acquire + ABI-fork
 $BIN scan  CBQD... mainnet --fork  # STATE-FORK: pull real on-chain state via RPC
 $BIN roundtrip CBQD... mainnet     # value-conservation (broken-math) lens
 ```
+
+**Two probing depths.** `probe` tests each function once (single-shot). `fuzz`
+explores *sequences* of calls with a coverage-guided corpus and reports the
+minimal sequence that triggers an objective — it finds bugs that only exist after
+a setup sequence (e.g. `arm() -> fire()`), which single-shot probing structurally
+cannot reach. Argument synthesis is **ABI-driven**: structured/UDT arguments
+(`Signer`, `Signatures`, `Vec`, `Map`) are built from the deployed wasm's
+contractspec, so functions with composite arguments are actually probed rather
+than skipped.
 
 **Auth-bypass provers (`harness/`, runs the real `__check_auth`):**
 
