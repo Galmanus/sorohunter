@@ -399,7 +399,7 @@ fn shrink_seq(wasm: &[u8], ctor: &[String], fns: &[&FnPlan], seq: &[usize], targ
 /// single-shot probing structurally cannot reach. Coverage-guided: a sequence
 /// that reaches a new (fn, outcome) is kept in the corpus and extended. Snapshot
 /// via replay-from-scratch (deterministic).
-pub fn probe_fuzz(wasm: &[u8], plan: &[FnPlan], rounds: u32, max_seq: usize) -> Vec<Verdict> {
+pub fn probe_fuzz(wasm: &[u8], plan: &[FnPlan], rounds: u32, max_seq: usize, seeds: &[Vec<String>]) -> Vec<Verdict> {
     let ctor: Vec<String> = plan
         .iter()
         .find(|p| p.name == "__constructor")
@@ -413,6 +413,17 @@ pub fn probe_fuzz(wasm: &[u8], plan: &[FnPlan], rounds: u32, max_seq: usize) -> 
         return Vec::new();
     }
     let mut corpus: Vec<Vec<usize>> = vec![Vec::new()];
+    // LLM-seeded corpus: exploit-shaped fn-name sequences (proposed once by an
+    // LLM, cached to disk, read here for determinism) become starting points the
+    // fuzzer extends/mutates. The LLM only GUIDES exploration; every verdict is
+    // still proven by execution (zero-FP preserved). Unknown fn names are dropped.
+    let name_idx = |n: &str| fns.iter().position(|p| p.name == n);
+    for s in seeds {
+        let mapped: Vec<usize> = s.iter().filter_map(|n| name_idx(n)).collect();
+        if !mapped.is_empty() {
+            corpus.push(mapped);
+        }
+    }
     let mut coverage: HashSet<String> = HashSet::new();
     let mut found: HashSet<String> = HashSet::new();
     let mut findings: Vec<Verdict> = Vec::new();
