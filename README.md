@@ -30,12 +30,18 @@ fork**, and reports every finding as the **exact invocation sequence that produc
 it** — an executed proof, not an inference. It never signs or sends a transaction
 to a live network.
 
-Two things live in this repo:
+Three layers live in this repo:
 
-1. **The hunter** — an ABI-driven, fork-validated detector engine (Python reference
-   + a self-contained Rust binary) that runs eleven adversary techniques against a
-   contract's public WASM and confirms each finding by execution.
-2. **The oracle layer** — [`oracles/`](oracles/): executed *algebraic* ground-truth
+1. **The hunter agent** ([`recon/hunter.py`](recon/hunter.py)) — an autonomous,
+   continually-learning hunting loop: recon → per-target **peer memory** →
+   LLM-seeded corpus (primed by what broke similar contracts) → execution-proof
+   battery → update memory. It gets sharper across targets, and **every verdict is
+   still proven by execution** — the learning never trades away zero-FP.
+2. **The engine** — an ABI-driven, fork-validated detector + **fuzzer** (Python
+   reference + a self-contained Rust binary): single-fn technique detectors, the
+   smart-account / economic **provers**, and a stateful, coverage-guided, economic
+   fuzzer with ABI-driven argument synthesis and an LLM-seeded corpus.
+3. **The oracle layer** — [`oracles/`](oracles/): executed *algebraic* ground-truth
    oracles that reverse-engineer the Soroban host itself (`rs-soroban-env`) to prove
    language-level fault classes, plus a pure-Python WASM detector. Born from the
    [language deconstruction study](SOROBAN_LANGUAGE_STUDY.md).
@@ -48,6 +54,8 @@ Two things live in this repo:
 
 ## Table of contents
 
+- [The hunter agent — autonomous, continually-learning](#the-hunter-agent--autonomous-continually-learning)
+- [The fuzzer — stateful, economic, LLM-guided](#the-fuzzer--stateful-economic-llm-guided)
 - [The one invariant: fork-validation](#the-one-invariant-fork-validation)
 - [The legal perimeter (a code invariant)](#the-legal-perimeter-a-code-invariant)
 - [The two axioms](#the-two-axioms)
@@ -65,6 +73,67 @@ Two things live in this repo:
 - [Honesty & scope](#honesty--scope)
 - [Positioning](#positioning)
 - [Documents](#documents)
+
+---
+
+## The hunter agent — autonomous, continually-learning
+
+[`recon/hunter.py`](recon/hunter.py) unifies every layer into one self-improving
+loop:
+
+```
+recon → per-target peer memory → LLM-seeded corpus (primed by what broke
+      similar contracts) → execution-proof battery → update memory → repeat
+```
+
+- **Peer memory (Honcho-style).** Each target is a peer with a representation on
+  disk (class, ABI, verdicts, hunt count). A **global knowledge** file, keyed by
+  contract *class* (smart-account / zk-verifier / lending / token / vault /
+  generic), records which detectors hit and which exploit-shaped seeds paid off.
+- **The learning flywheel.** Break a vault once, and the next vault is fuzzed with
+  the seeds that worked — the agent gets sharper across targets, the way a memory
+  layer for agents accumulates a model over time.
+- **The sacred invariant.** Memory and the LLM guide *where* to look and *what* to
+  try; the verdict is **always proven by execution**. ML/memory live in the loop,
+  never in the verdict — zero-FP is never traded for the learning.
+
+```bash
+python3 recon/hunter.py CBQD...              # fetch mainnet wasm, hunt, learn
+python3 recon/hunter.py path/to.wasm --local # hunt a local wasm
+```
+
+Nobody else has this for Soroban: an adversarial hunter that is autonomous,
+learns across targets, and still proves every finding by execution.
+
+---
+
+## The fuzzer — stateful, economic, LLM-guided
+
+Single-shot probing tests each function once. The fuzzer explores **sequences** of
+calls and tracks value flow, finding bugs single-shot structurally cannot reach.
+
+- **P0 — ABI-driven argument synthesis.** Structured/UDT arguments (`Signer`,
+  `Signatures`, `Vec`, `Map`) are built recursively from the deployed wasm's
+  contractspec, so functions with composite arguments are actually fuzzed rather
+  than skipped — the black-box analogue of `SorobanArbitrary`.
+- **P1 — stateful, coverage-guided.** Fuzzes call sequences with a coverage-guided
+  corpus; deterministic (fixed seed, reproducible); reports the **minimal**
+  sequence that triggers an objective (e.g. `arm() → fire()`).
+- **P2/P3 — economic.** Sets up a real token + funded target + attacker, fuzzes
+  sequences with the attacker as the (legitimately authorized) actor, and reports
+  any sequence that leaves the attacker in **net token profit** — value drained
+  from the protocol. This is the composition-level solvency check that per-contract
+  formal verification does not model.
+- **LLM-seeded corpus.** An LLM (or a heuristic fallback) proposes exploit-shaped
+  call sequences from the ABI; these seed the corpus. The LLM only *guides*
+  exploration — every finding is still execution-proven, and the seed is cached to
+  disk so the deterministic fuzzer replays identically.
+
+```bash
+python3 recon/seed_corpus.py path/to.wasm            # LLM/heuristic corpus seed
+$BIN fuzz path/to.wasm --seed path/to.wasm.seed.json # stateful seeded fuzz
+$HARNESS --econ path/to.wasm out.json deposit,withdraw   # economic multi-call fuzz
+```
 
 ---
 
@@ -137,12 +206,19 @@ Every detector and every oracle is an instance of one of these.
   (`bench` / `scan` / `probe`), `report.py` (precision/recall vs ground truth).
   Small, readable, the spec of record.
 - **`soro/` (Rust, binary `sorohunter`)** — the same pipeline consolidated into one
-  self-contained binary running `bench` / `probe` / `scan` / `roundtrip`
-  **in-process** (no subprocess-per-probe). Modules: `abi.rs`, `engine.rs`,
-  `fork.rs`, `rpc.rs`, `econ.rs`, `cve.rs`, `report.rs`, `main.rs`. **29 Rust
-  tests**, parity with the Python reference proven on real contracts.
-- **`harness/` (Rust)** — the low-level fork executor: loads WASM, synthesizes
-  typed `Val`s, invokes dynamically by symbol, classifies via event/state diff.
+  self-contained binary running `bench` / `probe` / `fuzz` / `scan` / `roundtrip` /
+  `abi` **in-process** (no subprocess-per-probe). Modules: `abi.rs`, `engine.rs`
+  (detectors + the stateful/coverage-guided fuzzer), `fork.rs`, `rpc.rs`, `econ.rs`,
+  `cve.rs`, `report.rs`, `main.rs`. **30 Rust tests**, parity with the Python
+  reference proven on real contracts.
+- **`harness/` (Rust)** — the low-level fork executor and the executed **provers**
+  (`--checkauth` / `--replay` / `--realauth[-p256]` / `--allowance` / `--feetoken`
+  / `--scope` / `--econ`): loads WASM, synthesizes typed `Val`s, invokes
+  dynamically by symbol, classifies via event/state/balance diff.
+- **`recon/`** — acquisition + the agent: `hunter.py` (the autonomous
+  continually-learning loop), `seed_corpus.py` (LLM-seeded fuzzer corpus),
+  `harvest_events.py` / `hunt_rpc.py` (live-contract enumeration). **35 Python
+  regression tests** in `tests/` gate the provers and the fuzzer.
 
 ---
 
@@ -188,6 +264,10 @@ ripples to every wallet built on it. Full write-up and honest limits in
 | `--replay` | signature not bound to payload (synthetic 96-byte ABI) | one genuine `(msg, sig)` pair authorizes a **different** payload — the binding bug, on a controlled fixture ABI |
 | `--realauth` | real passkey-kit **ed25519** signer branch | deploys the actual `Signer`-constructor wasm and drives its genuine `__check_auth` with a real ed25519 signature in the target's own `Signatures(Map<SignerKey,Signature>)` type |
 | `--realauth-p256` | real passkey-kit **secp256r1 / WebAuthn** signer branch | forges a genuine WebAuthn assertion (authenticatorData + clientDataJSON + ECDSA-secp256r1) and tests cross-payload replay — the swig-wallet #143 challenge-binding class, where the bug that actually ships lives |
+| `--allowance` | **TA-06** unrestricted `transfer_from` | mints a victim, has the victim grant a standing allowance, then calls the fn under empty auth — a real drop in the victim's balance with no victim signature is the executed proof |
+| `--feetoken` | **TM-02** fee-on-transfer accounting | deploys a real 10%-fee token + the target vault, deposits through it, and proves the vault over-credits (credit > tokens held) → insolvent. Grounded in Coinspect Tricorn TRI-005 |
+| `--scope` | **TA-04** auth-arg scope mismatch | mocks the payer's authorization scoped to only `[payer]`, then redirects `pay(payer, attacker, amount)` — value moving to the attacker proves the auth did not bind `(to, amount)` |
+| `--econ` | economic multi-call drain | fuzzes attacker-authorized sequences tracking net token profit — the composition-level solvency finding that per-contract formal verification does not model |
 
 Ground truth is a set of paired safe-vs-vuln fixtures in [`bench/`](bench/) gated by
 `tests/test_checkauth.py` and `tests/test_realauth.py`: the `good_account` /
@@ -303,6 +383,10 @@ $BIN --checkauth      <wasm> <out.json> <ctor_csv>   # forgery battery on __chec
 $BIN --replay         <wasm> <out.json> <ctor_csv>   # cross-payload replay (synthetic ABI)
 $BIN --realauth       <wasm> <out.json>              # real passkey-kit ed25519 branch
 $BIN --realauth-p256  <wasm> <out.json>              # real passkey-kit secp256r1 / WebAuthn branch
+$BIN --allowance      <wasm> <out.json> <fn:types>   # TA-06 unrestricted transfer_from (third-party drain)
+$BIN --feetoken       <wasm> <out.json> <fee_token>  # TM-02 fee-on-transfer over-credit / insolvency
+$BIN --scope          <wasm> <out.json>              # TA-04 auth-arg scope mismatch (redirect)
+$BIN --econ           <wasm> <out.json> <fn1,fn2,..> # economic multi-call drain (net attacker profit)
 ```
 
 `scan --fork` is what upgrades an ABI finding to a value finding: it lazily fetches
