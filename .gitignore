@@ -6,3 +6,7 @@ verdicts*.json
 .pytest_cache/
 reports/_*
 soro/RESEARCH_DOSSIER.md
+
+recon/out/peers/
+recon/out/knowledge.json
+recon/out/*.seed.json
