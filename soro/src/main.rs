@@ -111,7 +111,18 @@ fn cmd_probe(wasms: &[String]) -> i32 {
 /// P1 stateful coverage-guided fuzzer over a local WASM file. Explores call
 /// sequences to find bugs that need a setup sequence (which single-shot probing
 /// misses). Deterministic (fixed seed).
-fn cmd_fuzz(wasms: &[String], rounds: u32, seq: usize) -> i32 {
+/// Load an LLM-seeded corpus file: JSON list of fn-name sequences, e.g.
+/// [["initialize","set_admin"],["deposit","withdraw","withdraw"]].
+fn load_seeds(path: &str) -> Vec<Vec<String>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    serde_json::from_str::<Vec<Vec<String>>>(&raw).unwrap_or_default()
+}
+
+fn cmd_fuzz(wasms: &[String], rounds: u32, seq: usize, seed_path: Option<&str>) -> i32 {
+    let seeds = seed_path.map(load_seeds).unwrap_or_default();
     let mut total = 0usize;
     for w in wasms {
         if !std::path::Path::new(w).exists() {
@@ -128,8 +139,8 @@ fn cmd_fuzz(wasms: &[String], rounds: u32, seq: usize) -> i32 {
             continue;
         }
         let label = std::path::Path::new(w).file_stem().unwrap().to_string_lossy().into_owned();
-        let verdicts = engine::probe_fuzz(&wasm, &plan, rounds, seq);
-        println!("\n{} (fuzz: {} rounds, seq<={})", label, rounds, seq);
+        let verdicts = engine::probe_fuzz(&wasm, &plan, rounds, seq, &seeds);
+        println!("\n{} (fuzz: {} rounds, seq<={}, {} llm-seeds)", label, rounds, seq, seeds.len());
         if verdicts.is_empty() {
             println!("  clean — no sequence triggered an objective");
         }
@@ -516,6 +527,7 @@ fn main() {
             let mut wasms = Vec::new();
             let mut rounds = 300u32;
             let mut seq = 4usize;
+            let mut seed_path: Option<String> = None;
             let mut i = 1;
             while i < args.len() {
                 if args[i] == "--rounds" && i + 1 < args.len() {
@@ -524,12 +536,23 @@ fn main() {
                 } else if args[i] == "--seq" && i + 1 < args.len() {
                     seq = args[i + 1].parse().unwrap_or(4);
                     i += 2;
+                } else if args[i] == "--seed" && i + 1 < args.len() {
+                    seed_path = Some(args[i + 1].clone());
+                    i += 2;
                 } else {
                     wasms.push(args[i].clone());
                     i += 1;
                 }
             }
-            cmd_fuzz(&wasms, rounds, seq)
+            cmd_fuzz(&wasms, rounds, seq, seed_path.as_deref())
+        }
+        Some("abi") if args.len() > 1 => {
+            // Dump exported fn names as JSON (input for the LLM corpus seeder).
+            let wasm = std::fs::read(&args[1]).expect("read wasm");
+            let plan = abi::plan_from_wasm(&wasm);
+            let names: Vec<String> = plan.iter().filter(|p| p.name != "__constructor").map(|p| p.name.clone()).collect();
+            println!("{}", serde_json::to_string(&names).unwrap_or_else(|_| "[]".into()));
+            0
         }
         Some("scan") if args.len() > 1 => {
             let id = args[1].clone();
