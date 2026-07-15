@@ -22,13 +22,23 @@
                                   sorohunter · it bites what it finds
 ```
 
-**The fork-validated detector layer for the [Soroban ATT&CK](SOROBAN_ATTACK.md).**
+**An adversarial security agent for Soroban that hunts on its own, learns across
+targets, and proves every finding by execution.**
 
-sorohunter points generic, ABI-driven adversary probes at deployed Stellar/Soroban
-contracts, executes each attack technique step-by-step in a **local `soroban-sdk`
-fork**, and reports every finding as the **exact invocation sequence that produced
-it** — an executed proof, not an inference. It never signs or sends a transaction
-to a live network.
+Most contract scanners read source and *guess* — "this looks vulnerable" — and
+you pay for it in false positives. sorohunter does not guess. It deploys the
+target's real bytecode into a **local `soroban-sdk` fork** and *breaks in*, and it
+reports a bug only when it actually did, with the **exact call sequence as the
+proof**. No inference step, so none of the false-positive class that taxes
+LLM-only scanners: a finding is a run, not an opinion. It never signs or sends a
+transaction to a live network.
+
+And it is not a linter — it is a **hunter that gets sharper**. An autonomous loop
+acquires live contracts, remembers what broke similar ones, seeds a stateful
+fuzzer with those exploit shapes, and confirms every hit by execution. The memory
+and the LLM guide *where* to look; the verdict is always earned by running it.
+That combination — adversarial, execution-proven, and continually learning — does
+not exist anywhere else for Soroban.
 
 Three layers live in this repo:
 
@@ -52,8 +62,40 @@ Three layers live in this repo:
 
 ---
 
+## In plain words
+
+A smart contract is a **money-robot-safe** on the internet, with rules like "only
+the owner withdraws" or "you can only set it up once." If a rule has a hole, someone
+robs it.
+
+sorohunter is an **honest thief** you hire to try to crack the safe — but on a
+**perfect copy**, never the real one. It only shouts "found a hole!" when it
+*actually got in*, and hands you the exact recording of the break-in. If it can't
+get in, it stays quiet. It never says "this looks vulnerable" — it's either proof
+or silence.
+
+What makes it sharp:
+
+- It doesn't try one trick at a time — it tries **combinations** ("pull this lever,
+  *then* force the door"), because many robberies only work as a sequence.
+- It **counts the money**: did the thief end up richer than they started? If a
+  sequence of moves leaves them in profit, that's an economic hole.
+- A smart advisor (an LLM) suggests **which combinations to try first** — but the
+  advisor only picks *where to look*; whether it's a real hole is always decided by
+  actually doing it. A bad hint just wastes a dead branch, never a false alarm.
+- Biggest of all: it's now a **robot hunter that works on its own and remembers**.
+  It cracks a safe, notes what worked, and the next time it sees a *similar* safe it
+  starts with what paid off. Every safe it tries, it gets smarter.
+
+The one rule it never breaks: memory and the advisor say *where* to look and *what*
+to try; the "found a hole" is **always** proven by doing it for real on the copy.
+It never trades honesty for cleverness.
+
+---
+
 ## Table of contents
 
+- [In plain words](#in-plain-words)
 - [The hunter agent — autonomous, continually-learning](#the-hunter-agent--autonomous-continually-learning)
 - [The fuzzer — stateful, economic, LLM-guided](#the-fuzzer--stateful-economic-llm-guided)
 - [The one invariant: fork-validation](#the-one-invariant-fork-validation)
