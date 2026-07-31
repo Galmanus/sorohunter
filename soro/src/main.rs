@@ -171,7 +171,7 @@ fn network_id(network: &str) -> [u8; 32] {
     }
 }
 
-fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
+fn cmd_scan(id: &str, network: &str, fork: bool, json: bool) -> i32 {
     let url = rpc::rpc_url(network);
     let verdicts = if fork {
         eprintln!("acquiring {} ({}) — STATE-FORK via RPC (real full on-chain state, lazy) ...", id, network);
@@ -256,6 +256,30 @@ fn cmd_scan(id: &str, network: &str, fork: bool) -> i32 {
         }
         engine::probe_contract(&wasm, ATTACKER, &plan)
     };
+
+    // Machine-readable mode: one JSON object on stdout, diagnostics stay on stderr.
+    // Consumed by the x402 paywall, which sells one scan as one billable unit.
+    if json {
+        let findings = report::findings(&verdicts);
+        let out = serde_json::json!({
+            "contract": id,
+            "network": network,
+            "mode": if fork { "state-fork" } else { "fresh-deploy" },
+            "probes": verdicts.len(),
+            "finding_count": findings.len(),
+            "confirmed": fork,
+            "probe_results": verdicts.iter().map(|v| serde_json::json!({
+                "fn": v.fn_name,
+                "arg_types": v.arg_types,
+                "verdict": v.verdict,
+                "events_delta": v.events_delta,
+                "detail": v.detail,
+                "is_finding": engine::FINDING_VERDICTS.contains(&v.verdict.as_str()),
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", out);
+        return 0;
+    }
 
     println!("\n{}: {} probes{}", id, verdicts.len(), if fork { " (state-fork)" } else { "" });
     for v in &verdicts {
@@ -558,6 +582,7 @@ fn main() {
             let id = args[1].clone();
             let mut network = "testnet".to_string();
             let mut fork = false;
+            let mut json = false;
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--network" && i + 1 < args.len() {
@@ -566,14 +591,17 @@ fn main() {
                 } else if args[i] == "--fork" {
                     fork = true;
                     i += 1;
+                } else if args[i] == "--json" {
+                    json = true;
+                    i += 1;
                 } else {
                     i += 1;
                 }
             }
-            cmd_scan(&id, &network, fork)
+            cmd_scan(&id, &network, fork, json)
         }
         _ => {
-            eprintln!("usage: sorohunter <bench | probe <wasm...> | scan <id> [--network <net>] [--fork] | econ <id> | cve <id> [--network <net>]>");
+            eprintln!("usage: sorohunter <bench | probe <wasm...> | scan <id> [--network <net>] [--fork] [--json] | econ <id> | cve <id> [--network <net>]>");
             2
         }
     };
