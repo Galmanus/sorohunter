@@ -25,7 +25,7 @@
 **An adversarial security agent for Soroban that hunts on its own, learns across
 targets, and proves every finding by execution.**
 
-![sorohunter explainer](assets/explainer-v2.gif)
+![sorohunter explainer](assets/explainer-v3.gif)
 
 <sub>▶️ explainer — probe, execute in a local fork, prove the finding by the exact invocation. Full-quality MP4: [assets/explainer.mp4](assets/explainer.mp4).</sub>
 
