@@ -25,6 +25,10 @@
 **An adversarial security agent for Soroban that hunts on its own, learns across
 targets, and proves every finding by execution.**
 
+![sorohunter explainer](assets/explainer.gif)
+
+<sub>▶️ explainer — probe, execute in a local fork, prove the finding by the exact invocation. Full-quality MP4: [assets/explainer.mp4](assets/explainer.mp4).</sub>
+
 Most contract scanners read source and *guess* — "this looks vulnerable" — and
 you pay for it in false positives. sorohunter does not guess. It deploys the
 target's real bytecode into a **local `soroban-sdk` fork** and *breaks in*, and it
